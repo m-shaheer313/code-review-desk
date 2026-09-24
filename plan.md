@@ -103,7 +103,16 @@ class Finding(BaseModel):
     line: int
     severity: Literal["critical", "major", "minor"]
     message: str = Field(min_length=1)
+    source_reviewer: str = ""   # stamped by the runner, not by the model
 ```
+
+**Note — `source_reviewer` (added during FR-6).** FR-6's remediation handoff fires on "a critical
+security finding" (spec.md §4.6), so a finding has to carry which reviewer produced it. The field is
+**stamped by `review_runner` after each reviewer's run completes**, overwriting whatever the model
+put there — the run knows which agent produced the output, the model's claim about itself is not
+evidence. Because strict JSON schemas mark every property required, the field does appear in the
+generated schema and the model is obliged to emit it; each reviewer's instructions therefore tell it
+to send an empty string.
 
 Each reviewer's `output_type` is `list[Finding]`. Per the brief's own note: the SDK wraps a list
 root in a single-key object because strict JSON schemas must be objects — inspect the generated

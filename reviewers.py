@@ -45,6 +45,19 @@ SECURITY_MAX_TOKENS = 4096
 TESTS_TEMPERATURE = 0.2
 TESTS_MAX_TOKENS = 4096
 
+SECURITY_REVIEWER_NAME = "SecurityReviewer"
+TESTS_REVIEWER_NAME = "TestsReviewer"
+STYLE_REVIEWER_NAME = "StyleReviewer"
+
+# `Finding.source_reviewer` is part of the strict output schema, so the model is
+# obliged to emit the field. Its value is overwritten by the orchestrator with the
+# reviewer that actually produced the finding, so asking for an empty string keeps
+# the model from spending tokens inventing one.
+SOURCE_FIELD_NOTE = (
+    "Set source_reviewer to an empty string on every finding. The system fills "
+    "that field in; anything you put there is discarded."
+)
+
 BASE_INSTRUCTIONS = (
     "Placeholder. This base reviewer is never run directly — it exists only to be "
     "cloned, and every clone replaces these instructions."
@@ -145,7 +158,8 @@ def build_style_instructions(context: ReviewContext | None) -> str:
         "diff, the line number, a severity of 'critical', 'major' or 'minor', and "
         "a message. Style issues are rarely 'critical'. If the diff violates "
         "nothing, return an empty list — never a finding that says the code is "
-        "fine."
+        "fine.\n\n"
+        f"{SOURCE_FIELD_NOTE}"
     )
 
 
@@ -198,7 +212,8 @@ def build_security_instructions(context: ReviewContext | None) -> str:
         "only the unified diff you are given. Return a list of findings, each with "
         "the file path from the diff, the line number, a severity and a message. "
         "If the diff introduces no security problem, return an empty list — never "
-        "a finding that says the code is safe."
+        "a finding that says the code is safe.\n\n"
+        f"{SOURCE_FIELD_NOTE}"
     )
 
 
@@ -245,7 +260,8 @@ def build_tests_instructions(context: ReviewContext | None) -> str:
         "the unified diff you are given. Return a list of findings, each with the "
         "file path from the diff, the line number, a severity and a message. If "
         "the diff's test coverage is adequate, return an empty list — never a "
-        "finding that says coverage is fine."
+        "finding that says coverage is fine.\n\n"
+        f"{SOURCE_FIELD_NOTE}"
     )
 
 
@@ -288,7 +304,7 @@ def build_style_reviewer() -> Agent[ReviewContext]:
     """Style Reviewer: a clone of Base with per-run instructions and the ruleset
     tool. The forced `get_ruleset` call (FR-9a) is deliberately not wired yet."""
     return build_base_reviewer().clone(
-        name="StyleReviewer",
+        name=STYLE_REVIEWER_NAME,
         instructions=_style_instructions_for_run,
         tools=[get_ruleset],
         output_type=list[Finding],
@@ -307,7 +323,7 @@ def build_security_reviewer() -> Agent[ReviewContext]:
     hooks attach to this reviewer only, in FR-10.
     """
     return build_base_reviewer().clone(
-        name="SecurityReviewer",
+        name=SECURITY_REVIEWER_NAME,
         instructions=_security_instructions_for_run,
         tools=[get_ruleset],
         output_type=list[Finding],
@@ -322,7 +338,7 @@ def build_tests_reviewer() -> Agent[ReviewContext]:
     """Tests Reviewer: a clone of Base with per-run instructions. `get_ruleset`
     is available but not forced (plan.md §3)."""
     return build_base_reviewer().clone(
-        name="TestsReviewer",
+        name=TESTS_REVIEWER_NAME,
         instructions=_tests_instructions_for_run,
         tools=[get_ruleset],
         output_type=list[Finding],

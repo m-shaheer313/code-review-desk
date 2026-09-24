@@ -20,3 +20,12 @@ class Finding(BaseModel):
     line: int
     severity: Severity
     message: str = Field(min_length=1)
+    # Which reviewer produced this finding. FR-6's remediation handoff fires on a
+    # critical finding *from the Security Reviewer* specifically, so the source
+    # has to travel with the finding.
+    #
+    # The model is not trusted for this value: `review_runner` overwrites it on
+    # every finding with the name of the reviewer whose run actually produced it.
+    # Anything the model puts here is discarded. Keep the default empty so an
+    # unstamped finding is visibly unstamped rather than plausibly mislabeled.
+    source_reviewer: str = ""

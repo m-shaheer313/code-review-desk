@@ -26,14 +26,20 @@ from config import REVIEWER_MAX_TURNS
 from finding import Finding
 from review_context import ReviewContext
 from reviewers import (
+    SECURITY_REVIEWER_NAME,
+    STYLE_REVIEWER_NAME,
+    TESTS_REVIEWER_NAME,
     build_security_reviewer,
     build_style_reviewer,
     build_tests_reviewer,
 )
 
-SECURITY = "SecurityReviewer"
-TESTS = "TestsReviewer"
-STYLE = "StyleReviewer"
+# Single source of truth for these names is `reviewers.py`, where the agents are
+# defined — `Finding.source_reviewer` and FR-6's handoff decision both compare
+# against them.
+SECURITY = SECURITY_REVIEWER_NAME
+TESTS = TESTS_REVIEWER_NAME
+STYLE = STYLE_REVIEWER_NAME
 
 
 @dataclass
@@ -109,16 +115,24 @@ async def _timed_run(
         elapsed[reviewer] = time.monotonic() - start
 
 
-def _findings_from(result) -> tuple[list[Finding], str | None]:
-    """Extract `list[Finding]` from a RunResult, defensively.
+def _findings_from(result, reviewer: str) -> tuple[list[Finding], str | None]:
+    """Extract `list[Finding]` from a RunResult, defensively, stamping the source.
 
     `output_type=list[Finding]` means `final_output` is already a plain list, but
     a reviewer that somehow returns something else must not corrupt the merge —
     it is treated as a failed reviewer instead.
+
+    `source_reviewer` is *overwritten*, not filled in only when blank: this run is
+    the authority on which reviewer produced these findings, so whatever the model
+    put in that field is discarded (FR-6's handoff decides on it).
     """
     output = getattr(result, "final_output", None)
     if isinstance(output, list) and all(isinstance(f, Finding) for f in output):
-        return output, None
+        stamped = [
+            finding.model_copy(update={"source_reviewer": reviewer})
+            for finding in output
+        ]
+        return stamped, None
     return [], f"reviewer returned {type(output).__name__}, expected list[Finding]"
 
 
@@ -173,7 +187,7 @@ async def run_all_reviewers(
                 )
             )
             continue
-        findings, problem = _findings_from(result)
+        findings, problem = _findings_from(result, name)
         outcomes.append(
             ReviewerOutcome(
                 reviewer=name,
