@@ -52,6 +52,13 @@ def _resolve_ruleset_path(ruleset_id: str) -> Path | None:
     return None
 
 
+def ruleset_exists(ruleset_id: str) -> bool:
+    """Whether this id resolves to a readable ruleset file. Used by the per-run
+    instruction builder (FR-4) to choose a neutral fallback phrase instead of
+    describing a ruleset that isn't there."""
+    return _resolve_ruleset_path(ruleset_id) is not None
+
+
 def load_ruleset_text(ruleset_id: str) -> str:
     """Return the ruleset's text, or an `unavailable` sentence. Never raises.
 
