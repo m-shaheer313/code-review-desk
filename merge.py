@@ -9,13 +9,19 @@ This agent gets no tools of its own: it reorganizes what it is handed and needs
 nothing from the filesystem or the run context.
 """
 
-from agents import Agent, ModelSettings, Tool
+import json
+
+from agents import Agent, ModelSettings, RunConfig, Tool
 
 from finding import Finding
 from review_context import ReviewContext
 from reviewers import shared_model
 
 MERGE_SPECIALIST_NAME = "MergeSpecialist"
+
+# Merge has no tools, so one turn is all it needs; the ceiling exists because
+# Article VI.2 requires every run to have one.
+MERGE_MAX_TURNS = 2
 
 # Merge is a mechanical task — dedupe and order. Variety is a defect here, so the
 # temperature is the lowest of any agent in the system (plan.md §2: "low").
@@ -24,16 +30,34 @@ MERGE_MAX_TOKENS = 4096
 
 MERGE_TOOL_NAME = "merge_findings"
 MERGE_TOOL_DESCRIPTION = (
-    "Deduplicate and severity-order the findings from all three reviewers. Pass "
-    "every finding you received, from every reviewer, as one collection. Returns "
-    "the same findings deduplicated and ordered critical first, then major, then "
-    "minor. It never adds, invents, or rewrites findings."
+    "Deduplicate and severity-order the findings from all three reviewers. Input "
+    'is a JSON object: {"findings": [ ... ]}, where each element has the keys '
+    "file, line, severity, message and source_reviewer. Pass every finding you "
+    "received, from every reviewer, in that one array. Returns the same findings "
+    "deduplicated and ordered critical first, then major, then minor. It never "
+    "adds, invents, or rewrites findings."
 )
+
+# The key the Desk serializes findings under, and the key Merge is told to expect.
+# Stated in both places so parsing is a contract, not an inference.
+MERGE_INPUT_KEY = "findings"
 
 MERGE_INSTRUCTIONS = (
     "You are a merge specialist. You are given the findings produced by three "
     "independent code reviewers (security, tests, style) over the same diff. You "
     "have exactly two jobs: deduplicate, then order.\n\n"
+    "INPUT FORMAT. Your input is a single JSON object with exactly one key, "
+    f'"{MERGE_INPUT_KEY}", whose value is an array of finding objects. Each '
+    "finding object has these keys, and only these:\n"
+    '  "file": string — the path from the diff\n'
+    '  "line": integer — the line number\n'
+    '  "severity": string — exactly one of "critical", "major", "minor"\n'
+    '  "message": string — the finding text, never empty\n'
+    '  "source_reviewer": string — which reviewer produced it, one of '
+    '"SecurityReviewer", "TestsReviewer", "StyleReviewer"\n'
+    "The array may be empty. It is not sorted and may contain duplicates across "
+    "reviewers — that is exactly what you are here to fix. Parse the JSON; do not "
+    "treat it as prose, and do not answer questions about it.\n\n"
     "DEDUPLICATE. Two findings are the same issue when they describe the same "
     "problem at the same place: identical file path, the same line or a line "
     "within one or two of it, and messages that mean the same thing even if the "
@@ -52,7 +76,7 @@ MERGE_INSTRUCTIONS = (
     "reorganizing someone else's work, not reviewing the code. You never see the "
     "diff and must not ask for it.\n\n"
     "Copy file, line, severity and source_reviewer through unchanged from the "
-    "finding you kept. If you were given no findings, return an empty list."
+    "finding you kept. If the input array is empty, return an empty list."
 )
 
 
@@ -71,9 +95,41 @@ def build_merge_specialist() -> Agent[ReviewContext]:
     )
 
 
-def as_merge_tool() -> Tool:
-    """Merge, wrapped as the tool the Desk calls (plan.md §2, §3)."""
+async def _merge_output_as_json(run_result) -> str:
+    """Serialize Merge's `list[Finding]` back to JSON for the caller.
+
+    Without this, the default extractor hands back whatever the final message
+    happened to look like — for a structured-output agent that is the raw strict
+    wrapper (`{"response": [...]}`), which makes the caller guess at the shape.
+    Emitting the same `{"findings": [...]}` contract Merge was given keeps both
+    ends of the tool boundary on one format.
+    """
+    output = getattr(run_result, "final_output", None)
+    if isinstance(output, list):
+        return json.dumps(
+            {
+                MERGE_INPUT_KEY: [
+                    finding.model_dump()
+                    for finding in output
+                    if isinstance(finding, Finding)
+                ]
+            }
+        )
+    # Not the expected shape — hand the raw text back and let the caller fall back
+    # to the unmerged union (plan.md §3) rather than raising.
+    return str(output)
+
+
+def as_merge_tool(run_config: RunConfig | None = None) -> Tool:
+    """Merge, wrapped as the tool the Desk calls (plan.md §2, §3).
+
+    `max_turns` is set because Article VI.2 bounds every run, and Merge's job is a
+    single turn — it has no tools to call.
+    """
     return build_merge_specialist().as_tool(
         tool_name=MERGE_TOOL_NAME,
         tool_description=MERGE_TOOL_DESCRIPTION,
+        custom_output_extractor=_merge_output_as_json,
+        max_turns=MERGE_MAX_TURNS,
+        run_config=run_config,
     )
