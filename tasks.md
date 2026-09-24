@@ -19,7 +19,7 @@ order, only after everything else in its phase is done.
 | T004 | Write and commit `plan.md` | Art. V | separate commit, no code | T003 |
 | T005 | Write and commit `tasks.md` (this file) | Art. V | separate commit, no code | T004 |
 | T006 | Create `.env.example` with placeholder keys only; commit it | NFR-1, Art. II.2 | no real secret in the file | T005 |
-| T007 | **Verify the model works on this project's API key before writing any reviewer code** — try a single test call against `gemini-2.5-flash`; if blocked (per constitution.md's Article I.1 note), amend via Article IX now, before Phase 1 | Art. I.1, IX | one successful or one documented-and-amended model call | T006 |
+| T007 | **Done.** Verified `gemini-2.5-flash` errors on this project's API key; amended `constitution.md` Article I.1 to `gemini-3.6-flash` via Article IX (commit `dd613ca` "constitution: replace gemini-2.5-flash with gemini-3.6-flash (Article I.1)") and reflected it the same day in `plan.md` §2 (commit `b486029` "docs: align plan.md model references to gemini-3.6-flash (Article IX amendment)") | Art. I.1, IX | documented-and-amended: constitution v1.1.0 names `gemini-3.6-flash`; no `gemini-2.5-flash` remains outside the Article I.1 historical note | T006 |
 | T008 | Verify Phase 0 gate: `git log --oneline` shows T002–T007 preceding any runtime-file commit | NFR-5 | log inspection | T002–T007 |
 
 **Gate:** do not proceed to Phase 1 until T008 is confirmed.
