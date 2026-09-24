@@ -1,42 +1,47 @@
-"""The Desk — orchestration of one whole review (FR-1 → FR-6).
+"""The Desk — a real Agent, wrapped in deterministic pre-processing (FR-1 → FR-8).
 
-DESIGN DECISION — the Desk has no `Agent` object yet, and this is deliberate.
+HOW "THE DESK IS AN AGENT" IS RECONCILED WITH "SPLITTING AND CONCURRENCY MUST
+STAY DETERMINISTIC":
 
-plan.md §2 describes the Desk as an agent with static instructions, `output_type
-Report`, and Remediation as a handoff target. That agent is still coming, but
-nothing built so far needs it, and two requirements actively argue against
-letting a model drive this step today:
+The deterministic steps moved **upstream of the agent run**, not into it. They are
+not tools the Desk may decline to call — they have already happened by the time
+the Desk's first token exists:
 
-- FR-1 requires the diff to be split **before any model sees it**, and FR-5
-  requires all three reviewers to be launched in one `asyncio.gather`. Both are
-  deterministic obligations. A model-driven Desk would decide for itself whether
-  to call the splitter and whether to launch reviewers together — it could satisfy
-  them on a good run and quietly violate them on a bad one, and Article V.1 says
-  concurrency is graded, not incidental.
-- The two things that genuinely require an `Agent` are FR-8's output guardrail
-  (guardrails attach to an agent) and FR-6's handoff *as a handoff* (the SDK's
-  handoff mechanism needs a source agent). Both are later work.
+    split_diff_by_file(diff)          <- no model involved at all (FR-1)
+    run_all_reviewers(...)            <- one asyncio.gather (FR-5)
+        |
+        v
+    Runner.run(desk_agent, <those findings as its input>)   <- the model's turn
+        |-- calls merge_findings (a real tool call it chooses to make)   FR-6
+        |-- hands off to RemediationSpecialist if warranted (real handoff) FR-6
+        '-- output_guardrails=[credential check] on the way out           FR-8
 
-So: deterministic orchestration now; the Desk `Agent` arrives with FR-8, wrapping
-this flow rather than replacing it. Two consequences are recorded honestly below,
-at the call sites — Merge is invoked as a tool object directly rather than by a
-model choosing to call it, and Remediation is invoked directly rather than reached
-by a true SDK handoff.
+So the Desk agent never decides *whether* the diff was split or *whether* the
+reviewers ran concurrently; it cannot, because both are finished facts in its
+input. Article V.1's "concurrency is graded, not incidental" stays enforced by
+construction, and FR-1's "before any model sees the diff" is likewise structural.
 
-Error-reporting pattern matches the rest of the codebase: `(result, error_message)`
-and no raising for expected failures (Article VIII).
+What the agent genuinely owns is the part that is model work: calling Merge, and
+judging whether a critical security finding warrants the handoff. That is the
+discretion plan.md §2 describes, and no more.
+
+TWO VALUES THE MODEL IS NOT TRUSTED WITH. `Report.footer` carries per-reviewer
+latency and token counts; a model asked to fill those in would invent them, and
+Article VII.3 forbids estimated or hardcoded numbers. So the footer is overwritten
+after the run from FR-5's real measurements — the same "stamp it from the run, not
+from the model" pattern already used for `Finding.source_reviewer`. The Desk's
+instructions tell it to emit an empty footer.
 """
 
 import json
 
-from agents import RunConfig, Runner
-from agents.exceptions import AgentsException
-from agents.tool_context import ToolContext
+from agents import Agent, ModelSettings, RunConfig, Runner
+from agents.exceptions import AgentsException, OutputGuardrailTripwireTriggered
 from openai import APIStatusError
-from pydantic import ValidationError
 
 from diff_utils import split_diff_by_file
 from finding import Finding
+from guardrail import ReportRefused, credential_output_guardrail, scan_report
 from merge import MERGE_INPUT_KEY, MERGE_TOOL_NAME, as_merge_tool
 from remediation import (
     REMEDIATION_SPECIALIST_NAME,
@@ -46,59 +51,91 @@ from remediation import (
 from report import Report, ReviewerFooterRow
 from review_context import ReviewContext
 from review_runner import GroupOutcome, run_all_reviewers
-from reviewers import SECURITY_REVIEWER_NAME
+from reviewers import SECURITY_REVIEWER_NAME, shared_model
 
-REMEDIATION_MAX_TURNS = 3  # no tools to call; Article VI.2 still requires a bound
+DESK_NAME = "Desk"
+
+# Orchestration, not authorship: the Desk reorganizes and decides, so precision
+# beats variety. plan.md §2 says "moderate temperature (e.g. 0.3)"; 0.2 given the
+# only judgement call left to it is the handoff.
+DESK_TEMPERATURE = 0.2
+DESK_MAX_TOKENS = 4096
+
+# One merge tool call, one optional handoff, one final Report — plus headroom.
+# Article VI.2 requires the bound to exist.
+DESK_MAX_TURNS = 6
+
+DESK_INSTRUCTIONS = (
+    "You are the desk of a code review service. Three independent reviewers "
+    "(security, tests, style) have ALREADY reviewed a diff concurrently, and their "
+    "raw findings are given to you as JSON. You never see the diff itself and must "
+    "not ask for it.\n\n"
+    f'YOUR INPUT is a JSON object with the keys "{MERGE_INPUT_KEY}" (the raw '
+    'findings from all three reviewers, unmerged and unordered) and '
+    '"critical_security_finding_present" (a boolean the system has already '
+    "computed for you).\n\n"
+    "STEP 1 — MERGE. Call the "
+    f"{MERGE_TOOL_NAME} tool exactly once, passing the findings array as a JSON "
+    f'object of the form {{"{MERGE_INPUT_KEY}": [...]}}. It returns the same '
+    "findings deduplicated and ordered by severity. Do not deduplicate or reorder "
+    "them yourself, and do not skip this call even when there is only one finding "
+    "or none.\n\n"
+    "STEP 2 — DECIDE. If critical_security_finding_present is true, hand off to "
+    f"the {REMEDIATION_SPECIALIST_NAME} so it can propose a fix in its own voice. "
+    "Pass it the merged findings. Hand off exactly once, and only when that flag "
+    "is true.\n\n"
+    "STEP 3 — REPORT. If you did not hand off, return a Report containing the "
+    "merged findings exactly as the merge tool returned them — same wording, same "
+    "severities, same order, same source_reviewer values. Set "
+    "remediation_proposed to false, leave remediation_proposal empty, and leave "
+    "notes empty.\n\n"
+    "Leave the footer as an EMPTY ARRAY. The system fills in latency and token "
+    "counts from its own measurements; anything you put there is discarded.\n\n"
+    "You must never invent a finding, reword one, change a severity, or add "
+    "commentary of your own. You are not reviewing code — you are assembling other "
+    "reviewers' work. Never repeat a credential value that appears in a finding; "
+    "describe it by location and kind only."
+)
 
 
-def findings_to_json(findings: list[Finding]) -> str:
-    """Serialize findings into the exact contract Merge's instructions state.
+def build_desk() -> Agent[ReviewContext]:
+    """The Desk agent (plan.md §2).
 
-    `source_reviewer` is included: Merge is told to copy it through, and FR-6's
-    handoff decision reads it off the merged result.
+    Merge is a real tool the model chooses to call; Remediation is a real handoff
+    target; FR-8's guardrail runs on the way out. Static instructions — the Desk's
+    job is orchestration, not per-turn personalization.
     """
-    return json.dumps({MERGE_INPUT_KEY: [f.model_dump() for f in findings]})
+    return Agent[ReviewContext](
+        name=DESK_NAME,
+        instructions=DESK_INSTRUCTIONS,
+        model=shared_model(),
+        model_settings=ModelSettings(
+            temperature=DESK_TEMPERATURE,
+            max_tokens=DESK_MAX_TOKENS,
+        ),
+        tools=[as_merge_tool()],
+        handoffs=[build_remediation_specialist()],
+        output_type=Report,
+        output_guardrails=[credential_output_guardrail],
+    )
 
 
-def parse_merged_findings(raw: str) -> tuple[list[Finding] | None, str | None]:
-    """Parse Merge's tool output back into findings.
-
-    Returns `(findings, error_message)`; `findings` is None when the output could
-    not be trusted, so the caller can fall back to the unmerged union rather than
-    presenting nothing (plan.md §3's failure-behavior column).
-
-    Accepts the `{"findings": [...]}` contract Merge is given and returns, and
-    also tolerates a bare array or the SDK's strict `{"response": [...]}` wrapper,
-    since a model that ignores its instructions should degrade rather than break
-    the review.
-    """
-    if not isinstance(raw, str) or not raw.strip():
-        return None, "merge returned nothing"
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None, "merge returned text that is not valid JSON"
-
-    if isinstance(payload, dict):
-        for key in (MERGE_INPUT_KEY, "response", "findings"):
-            if isinstance(payload.get(key), list):
-                payload = payload[key]
-                break
-        else:
-            return None, "merge returned JSON with no findings array"
-    if not isinstance(payload, list):
-        return None, "merge returned JSON that is not a findings array"
-
-    try:
-        return [Finding.model_validate(item) for item in payload], None
-    except ValidationError:
-        return None, "merge returned findings that failed validation"
+def desk_input(findings: list[Finding], critical_security_present: bool) -> str:
+    """The Desk's input: the reviewers' raw findings plus the deterministic
+    handoff decision. The decision is computed here, not inferred by the model,
+    so the handoff cannot fire on a reviewer's own idea of "critical"."""
+    return json.dumps(
+        {
+            MERGE_INPUT_KEY: [f.model_dump() for f in findings],
+            "critical_security_finding_present": critical_security_present,
+        }
+    )
 
 
 def build_footer(group: GroupOutcome) -> list[ReviewerFooterRow]:
-    """One row per reviewer. Latency is real (FR-5's timing); token counts wait
-    for FR-10's hooks — Article VII.3 forbids inventing them, so 0 means
-    "not measured yet"."""
+    """One row per reviewer, from the run's own measurements (never the model's).
+    `tokens` stays 0 until FR-10's hooks supply real usage — Article VII.3 forbids
+    inventing it, so 0 means "not measured yet"."""
     return [
         ReviewerFooterRow(
             reviewer=outcome.reviewer,
@@ -111,7 +148,7 @@ def build_footer(group: GroupOutcome) -> list[ReviewerFooterRow]:
 
 
 def critical_security_findings(findings: list[Finding]) -> list[Finding]:
-    """The findings that justify remediation — used to brief the specialist."""
+    """The findings that justify remediation — used for the deterministic flag."""
     return [
         f
         for f in findings
@@ -129,77 +166,50 @@ def _provider_message(exc: APIStatusError) -> str:
     return " ".join((message or str(exc)).split())[:300]
 
 
-async def _run_merge(
-    findings: list[Finding],
-    context: ReviewContext,
-    run_config: RunConfig | None,
-) -> tuple[list[Finding], str | None]:
-    """Call the merge tool. Returns `(findings, note)`; on any failure the
-    unmerged union comes back with a note, never an exception (plan.md §3)."""
-    if not findings:
-        return [], None
+def _report_from_run(result, raw_findings: list[Finding]) -> tuple[Report, list[str]]:
+    """Turn whatever the run produced into a Report.
 
-    # Invoked as a tool object directly: with no Desk agent, there is no model to
-    # choose to call it. The tool boundary itself is real — same FunctionTool the
-    # Desk agent will expose — so only the "who decided to call it" part is
-    # standing in. That flips when the Desk becomes an agent (FR-8).
-    merge_tool = as_merge_tool(run_config=run_config)
-    arguments = json.dumps({"input": findings_to_json(findings)})
-    tool_context = ToolContext(
-        context,
-        tool_name=MERGE_TOOL_NAME,
-        tool_call_id="desk_merge_1",
-        tool_arguments=arguments,
-        run_config=run_config,
-    )
-    try:
-        raw = await merge_tool.on_invoke_tool(tool_context, arguments)
-    except APIStatusError as exc:
-        return findings, f"merge unavailable ({exc.status_code}); findings not deduplicated"
-    except AgentsException as exc:
-        return findings, f"merge failed ({type(exc).__name__}); findings not deduplicated"
+    Two shapes are possible and both are legitimate:
+    - no handoff  -> `final_output` is a `Report` from the Desk itself
+    - handoff     -> `final_output` is the Remediation Specialist's proposal text,
+                     because after a handoff the last agent owns the reply
 
-    merged, problem = parse_merged_findings(raw)
-    if merged is None:
-        return findings, f"{problem}; findings not deduplicated"
-    return merged, None
-
-
-async def _run_remediation(
-    criticals: list[Finding],
-    context: ReviewContext,
-    run_config: RunConfig | None,
-) -> tuple[str | None, str | None]:
-    """Invoke the Remediation Specialist. Returns `(proposal, note)`.
-
-    NOTE — this is a direct invocation, not the SDK handoff spec.md §4.6 calls
-    for. A real handoff needs a source agent to hand off *from*; the agent object
-    used here is the same one that will be registered as the Desk's handoff target,
-    so the target is right and only the transfer mechanism is provisional.
+    In the handoff case the Report is assembled here around that text.
     """
-    specialist = build_remediation_specialist()
-    briefing = json.dumps(
-        {
-            "critical_security_findings": [f.model_dump() for f in criticals],
-        }
-    )
-    try:
-        result = await Runner.run(
-            specialist,
-            briefing,
-            context=context,
-            max_turns=REMEDIATION_MAX_TURNS,
-            run_config=run_config,
-        )
-    except APIStatusError as exc:
-        return None, f"remediation unavailable ({exc.status_code}): {_provider_message(exc)}"
-    except AgentsException as exc:
-        return None, f"remediation failed ({type(exc).__name__}: {exc})"
+    notes: list[str] = []
+    output = getattr(result, "final_output", None)
+    last_agent = getattr(getattr(result, "last_agent", None), "name", None)
 
-    proposal = getattr(result, "final_output", None)
-    if not isinstance(proposal, str) or not proposal.strip():
-        return None, f"{REMEDIATION_SPECIALIST_NAME} returned no proposal text"
-    return proposal, None
+    if isinstance(output, Report):
+        return output, notes
+
+    if isinstance(output, str) and output.strip():
+        if last_agent != REMEDIATION_SPECIALIST_NAME:
+            notes.append(
+                f"unexpected text output from {last_agent or 'the run'}; "
+                "treating it as a remediation proposal"
+            )
+        return (
+            Report(
+                findings=raw_findings,
+                footer=[],
+                remediation_proposed=True,
+                remediation_proposal=output,
+                notes=notes,
+            ),
+            notes,
+        )
+
+    notes.append("the desk produced no usable report; showing unmerged findings")
+    return (
+        Report(
+            findings=raw_findings,
+            footer=[],
+            remediation_proposed=False,
+            notes=notes,
+        ),
+        notes,
+    )
 
 
 async def run_review(
@@ -209,16 +219,20 @@ async def run_review(
 ) -> tuple[Report | None, str | None]:
     """Run one whole review. Returns `(report, error_message)`.
 
-    `report` is None only when there is nothing to review at all (empty or
-    malformed diff); every other failure degrades into a partial report with a
-    note (Article VIII.3).
+    Raises `ReportRefused` or `OutputGuardrailTripwireTriggered` when the report
+    cannot be shown (FR-8). Both are caught at the single top-level entry point in
+    `main.py` — deliberately NOT caught here, so there is exactly one place in the
+    program that decides what the user sees on a refusal.
+
+    `report` is None only when there is nothing to review at all; every other
+    failure degrades into a partial report with a note (Article VIII.3).
     """
     if run_config is None:
         # FR-13 will supply a configured RunConfig carrying this review's trace
         # grouping; until then tracing is off, set per run, never globally.
         run_config = RunConfig(tracing_disabled=True)
 
-    # (a) FR-1 — split before any model sees the diff.
+    # (a) FR-1 — deterministic, upstream of any model.
     chunks, split_error = split_diff_by_file(diff_text)
     if split_error is not None:
         return None, split_error
@@ -231,7 +245,7 @@ async def run_review(
         skipped = [c["file"] for c in chunks if not c["has_text_changes"]]
         notes.append(f"no reviewable text changes: {', '.join(skipped)}")
 
-    # (b) FR-5 — one gather, three reviewers, over the reviewable diff text.
+    # (b) FR-5 — deterministic, one gather, upstream of the Desk's run.
     review_input = "\n".join(chunk["diff_text"] for chunk in reviewable)
     group = await run_all_reviewers(review_input, context, run_config=run_config)
     notes.extend(
@@ -240,31 +254,76 @@ async def run_review(
         if outcome.failed
     )
 
-    # (c) + (d) FR-6 — serialize the union, merge it, parse the result back.
-    merged, merge_note = await _run_merge(group.all_findings, context, run_config)
-    if merge_note:
-        notes.append(merge_note)
+    raw_findings = group.all_findings
+    # The handoff decision is ours, not the model's (FR-6, spec.md §4.6's wording).
+    critical_present = decide_needs_remediation(raw_findings)
 
-    # (e) FR-6 — decide on the handoff from the merged findings.
-    needs_remediation = decide_needs_remediation(merged)
-
-    # (f) FR-6 — brief the specialist with the qualifying findings only.
-    proposal: str | None = None
-    if needs_remediation:
-        proposal, remediation_note = await _run_remediation(
-            critical_security_findings(merged), context, run_config
+    # (c)-(f) The Desk's own run: merge as a tool call, remediation as a handoff.
+    try:
+        result = await Runner.run(
+            build_desk(),
+            desk_input(raw_findings, critical_present),
+            context=context,
+            max_turns=DESK_MAX_TURNS,
+            run_config=run_config,
         )
-        if remediation_note:
-            notes.append(remediation_note)
+    except OutputGuardrailTripwireTriggered:
+        # FR-8 fired inside the run. Let it reach the entry point untouched — the
+        # report must not be partially shown (plan.md §6).
+        raise
+    except APIStatusError as exc:
+        notes.append(
+            f"the desk could not run ({exc.status_code}: {_provider_message(exc)}); "
+            "showing unmerged findings"
+        )
+        report = Report(
+            findings=raw_findings,
+            footer=build_footer(group),
+            remediation_proposed=False,
+            notes=notes,
+        )
+        _final_sweep(report)
+        return report, None
+    except AgentsException as exc:
+        notes.append(
+            f"the desk could not run ({type(exc).__name__}: {exc}); "
+            "showing unmerged findings"
+        )
+        report = Report(
+            findings=raw_findings,
+            footer=build_footer(group),
+            remediation_proposed=False,
+            notes=notes,
+        )
+        _final_sweep(report)
+        return report, None
 
-    # (g) plan.md §4.3 — assemble the Report.
-    report = Report(
-        findings=merged,
-        footer=build_footer(group),
-        # True when the handoff was warranted and produced a proposal. A failed
-        # remediation call must not claim a proposal exists.
-        remediation_proposed=bool(proposal),
-        remediation_proposal=proposal,
-        notes=notes,
-    )
+    # (g) Assemble: take the model's findings, overwrite what it must not own.
+    report, run_notes = _report_from_run(result, raw_findings)
+    report.footer = build_footer(group)  # real measurements, never the model's
+    report.notes = notes + [n for n in run_notes if n not in notes]
+    if critical_present and not report.remediation_proposed:
+        report.notes.append(
+            "a critical security finding was present but no remediation proposal "
+            "was produced"
+        )
+
+    # FR-8's final sweep over the assembled Report. The agent-level guardrail
+    # cannot see this object: after a handoff the Desk's guardrail never runs, and
+    # the footer/notes are attached after the run ends.
+    _final_sweep(report)
     return report, None
+
+
+def _final_sweep(report: Report) -> None:
+    """Last check before the Report leaves this module. Raises `ReportRefused`.
+
+    Fails toward refusal: if the scan itself errors, the report is still withheld
+    (spec.md §4.8's second edge case).
+    """
+    try:
+        hits = scan_report(report)
+    except Exception as exc:  # noqa: BLE001 — deliberate: unknown means unsafe
+        raise ReportRefused([]) from exc
+    if hits:
+        raise ReportRefused(hits)

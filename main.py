@@ -1,23 +1,39 @@
-"""Terminal entry point — FR-1 slice only.
+"""Terminal entry point.
 
-Reads a unified diff from a path on the command line, splits it per file, and
-reports how many chunks were found. No agent, tool, or ReviewContext is involved
-yet; nothing here calls a model.
+Reads a unified diff from a path on the command line and runs one review.
 
-The entry point is async and launched through `asyncio.run` (FR-1's third
-acceptance criterion). Per Article VIII.2, every expected failure — missing
-credential, unreadable path, empty or malformed diff — is caught here, at this
-one boundary, and printed as a plain line.
+THIS FILE IS THE SINGLE PLACE FR-8's TRIPWIRE IS CAUGHT. `run_review` deliberately
+lets `ReportRefused` and `OutputGuardrailTripwireTriggered` escape, so exactly one
+place in the program decides what the user sees when a report is withheld — see
+`_show_or_refuse` below. The report itself is discarded, never partially shown
+(Article II.4, plan.md §6).
+
+Per Article VIII.2, every other expected failure — missing credential, unreadable
+path, empty or malformed diff — is also caught here and printed as a plain line.
+The user never sees a traceback.
 """
 
 import asyncio
 import sys
 from pathlib import Path
 
+from agents.exceptions import OutputGuardrailTripwireTriggered
+
 from config import ConfigError, load_config
-from diff_utils import split_diff_by_file
+from guardrail import REFUSAL_MESSAGE, ReportRefused
+from report import Report
+from review_context import ReviewContext
 
 USAGE = "usage: python main.py <path-to-diff-file>"
+
+# FR-2: the review context for a terminal run. The Chainlit path (FR-12) will hold
+# its own per-session context instead.
+DEFAULT_CONTEXT = ReviewContext(
+    repo="code-review-desk",
+    language="Python",
+    ruleset_id="python-default",
+    strictness="normal",
+)
 
 
 def _read_diff_file(path: Path) -> tuple[str | None, str | None]:
@@ -36,7 +52,71 @@ def _read_diff_file(path: Path) -> tuple[str | None, str | None]:
         return None, f"could not read {path}: {exc.strerror or exc}"
 
 
+def print_report(report: Report) -> None:
+    """Render a report that has already passed the guardrail."""
+    if not report.findings:
+        print("no findings.")
+    else:
+        print(f"{len(report.findings)} finding(s):")
+        for finding in report.findings:
+            print(
+                f"  [{finding.severity:8}] {finding.file}:{finding.line} "
+                f"({finding.source_reviewer}) — {finding.message}"
+            )
+
+    if report.remediation_proposed and report.remediation_proposal:
+        print()
+        print("proposed fix (a proposal only — nothing has been applied):")
+        for line in report.remediation_proposal.splitlines():
+            print(f"  {line}")
+
+    print()
+    print("reviewer            ms  tokens  partial")
+    for row in report.footer:
+        print(f"  {row.reviewer:17} {row.ms:6} {row.tokens:7}  {row.partial}")
+
+    if report.notes:
+        print()
+        print("notes:")
+        for note in report.notes:
+            print(f"  - {note}")
+    if report.is_partial:
+        print()
+        print("this is a PARTIAL review: not every reviewer completed.")
+
+
+async def _show_or_refuse(diff_text: str) -> int:
+    """Run the review and either print the report or print the refusal.
+
+    >>> THIS is the single catch point for FR-8's tripwire. <<<
+    """
+    from desk import run_review  # imported here so a ConfigError stays catchable
+
+    try:
+        report, error = await run_review(diff_text, DEFAULT_CONTEXT)
+    except (ReportRefused, OutputGuardrailTripwireTriggered) as exc:
+        # The guardrail refused. Show the refusal and nothing else — no findings,
+        # no partial report, no detail about what matched.
+        print(REFUSAL_MESSAGE)
+        if isinstance(exc, ReportRefused) and exc.hits:
+            print()
+            print("withheld because of:")
+            for hit in exc.hits:
+                print(f"  - {hit.describe()}")
+        return 2
+
+    if error is not None:
+        print(error)
+        return 1
+
+    print_report(report)
+    return 0
+
+
 async def main() -> int:
+    # The reports contain em dashes; the Windows console defaults to cp1252.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     if len(sys.argv) != 2:
         print(USAGE)
         return 2
@@ -55,16 +135,7 @@ async def main() -> int:
         print(read_error)
         return 1
 
-    chunks, split_error = split_diff_by_file(diff_text)
-    if split_error is not None:
-        print(split_error)
-        return 1
-
-    print(f"{len(chunks)} file chunk{'s' if len(chunks) != 1 else ''} found:")
-    for chunk in chunks:
-        note = "" if chunk["has_text_changes"] else "  (no reviewable text changes)"
-        print(f"  - {chunk['file']}{note}")
-    return 0
+    return await _show_or_refuse(diff_text)
 
 
 if __name__ == "__main__":
