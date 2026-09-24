@@ -18,11 +18,11 @@ is clearly larger.
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from agents import Agent, RunConfig, Runner
 
-from config import REVIEWER_MAX_TURNS
+from config import REVIEWER_MAX_TURNS, build_model
 from finding import Finding
 from review_context import ReviewContext
 from reviewers import (
@@ -86,6 +86,45 @@ class GroupOutcome:
         """Every finding from every reviewer that completed, unmerged and
         unordered — Merge (FR-6) is what dedupes and orders them."""
         return [f for outcome in self.outcomes for f in outcome.findings]
+
+
+async def run_reviewer_with_override(
+    agent: Agent[ReviewContext],
+    diff_text: str,
+    context: ReviewContext,
+    model_name: str,
+    run_config: RunConfig | None = None,
+):
+    """Re-run one reviewer under a different model, at the RUN level (FR-7).
+
+    This is the single sanctioned exception to "configured at the agent level"
+    (Article I.3), and it is sanctioned only because it happens here: the model
+    travels in the run's configuration. `agent.model` is never read and never
+    assigned — the same agent object can be run under its own model and under this
+    override, and nothing about the agent differs between the two runs.
+
+    Returns a fresh `RunResult`: an entirely independent second review, not a
+    mutation of the first (spec.md §4.7's edge case).
+
+    The override is passed as a Model object rather than the name string, because
+    `RunConfig.model` resolves a bare string through `RunConfig.model_provider` —
+    which defaults to OpenAI's provider and would send the run to the wrong API.
+    """
+    override_model = build_model(model_name)
+    if run_config is None:
+        # Matches the rest of the codebase: tracing off until FR-13 supplies a
+        # configured RunConfig. Set per run, never globally.
+        run_config = RunConfig(tracing_disabled=True)
+    # `replace` keeps any trace grouping the caller set up and swaps only the model.
+    run_config = replace(run_config, model=override_model)
+
+    return await Runner.run(
+        agent,
+        diff_text,
+        context=context,
+        max_turns=REVIEWER_MAX_TURNS,  # a cheaper model is not a looser ceiling
+        run_config=run_config,
+    )
 
 
 async def _timed_run(
