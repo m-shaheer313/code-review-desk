@@ -197,7 +197,11 @@ def test_footer_is_overwritten_from_real_measurements() -> None:
     report, _ = asyncio.run(desk.run_review(DIFF, context()))
 
     assert len(report.footer) == 3, "one row per reviewer, from the run"
-    assert all(row.tokens == 0 for row in report.footer), "Article VII.3: never invented"
+    # This file stubs Runner.run, so the real runner never fires the run-level
+    # hooks: there is no measurement, so the footer claims none (None), and the
+    # model's invented 12345 is discarded. Real token flow is tested against the
+    # real runner in test_fr10_hooks.py.
+    assert all(row.tokens is None for row in report.footer), "Article VII.3: never invented"
     assert all(row.ms != 999999 for row in report.footer)
 
 

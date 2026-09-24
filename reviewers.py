@@ -17,6 +17,7 @@ from agents import Agent, ModelSettings, OpenAIChatCompletionsModel, RunContextW
 
 from config import load_config
 from finding import Finding
+from hooks import SecurityAgentHooks
 from review_context import ReviewContext
 from tools import get_ruleset, ruleset_exists
 
@@ -333,8 +334,11 @@ def build_security_reviewer() -> Agent[ReviewContext]:
     """Security Reviewer: a clone of Base with per-run instructions.
 
     `get_ruleset` is available but NOT forced (plan.md §3 marks it optional here)
-    — only Style's call is required, and that wiring comes with FR-9a. Agent-level
-    hooks attach to this reviewer only, in FR-10.
+    — only Style's call is required (FR-9a).
+
+    Agent-level hooks attach to this reviewer and no other (FR-10, spec.md §4.10's
+    design decision). A fresh `SecurityAgentHooks` per build, so one review's event
+    log never carries into the next (Article IV.1).
     """
     return build_base_reviewer().clone(
         name=SECURITY_REVIEWER_NAME,
@@ -345,6 +349,7 @@ def build_security_reviewer() -> Agent[ReviewContext]:
             temperature=SECURITY_TEMPERATURE,
             max_tokens=SECURITY_MAX_TOKENS,
         ),
+        hooks=SecurityAgentHooks(),
     )
 
 

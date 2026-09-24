@@ -1,9 +1,11 @@
 """The Desk's own output structure (plan.md §4.3, FR-6/FR-10).
 
-`footer` rows carry per-reviewer latency and token counts. Latency is real from
-FR-5's timing; `tokens` stays 0 until FR-10 wires the run-level hooks that read
-genuine usage data — Article VII.3 forbids estimated or hardcoded counts, so 0
-here means "not measured yet", not "measured as zero".
+`footer` rows carry per-reviewer latency and token counts, both measured, never
+estimated (Article VII.3): latency from FR-5's monotonic bracket around each run,
+tokens from FR-10's run-level hooks reading each run's own Usage.
+
+`tokens` is `int | None`. `None` means the hooks never saw that run's context, so
+there is no number to report; `0` would claim a measurement that did not happen.
 """
 
 from pydantic import BaseModel
@@ -14,7 +16,7 @@ from finding import Finding
 class ReviewerFooterRow(BaseModel):
     reviewer: str
     ms: int
-    tokens: int
+    tokens: int | None
     partial: bool = False  # true if this reviewer hit its ceiling or failed
 
 

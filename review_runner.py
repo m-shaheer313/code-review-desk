@@ -25,6 +25,7 @@ from agents.exceptions import MaxTurnsExceeded
 
 from config import REVIEWER_MAX_TURNS, build_model
 from finding import Finding
+from hooks import AgentEvent, ReviewerRunHooks
 from review_context import ReviewContext
 from reviewers import (
     SECURITY_REVIEWER_NAME,
@@ -49,11 +50,21 @@ class ReviewerOutcome:
 
     reviewer: str
     findings: list[Finding] = field(default_factory=list)
+    # Authoritative latency: the manual monotonic bracket around Runner.run, the
+    # same span the group's gather is measured over (FR-5). See _timed_run.
     elapsed_ms: int = 0
     failed: bool = False
     # Short, user-safe description of the failure — the exception type and its
     # message, never a traceback (Article VIII.2). None when the run succeeded.
     error: str | None = None
+    # FR-10, from the run-level hooks — real usage read from the run context.
+    # None means the hooks never saw the run's context, NOT "zero tokens".
+    tokens: int | None = None
+    llm_calls: int = 0
+    tool_calls: int = 0
+    # FR-10's agent-level event log. Populated only for an agent that carries
+    # agent-level hooks (Security); empty for the other two by design.
+    agent_events: list[AgentEvent] = field(default_factory=list)
 
 
 @dataclass
@@ -135,12 +146,21 @@ async def _timed_run(
     context: ReviewContext,
     run_config: RunConfig,
     elapsed: dict[str, float],
+    hooks: ReviewerRunHooks,
 ):
     """Run one reviewer, recording its own elapsed time.
 
     The timing lives in `try/finally` so a reviewer that raises still reports how
     long it ran, while the exception itself still propagates to `gather` — which
     is what makes `return_exceptions=True` meaningful rather than decorative.
+
+    This manual timer stays the footer's source of latency even now that run-level
+    hooks exist (FR-10). The hooks' first event fires after `Runner.run` has
+    started and `on_agent_end` never fires when a run raises, so a hook-based
+    elapsed time would be missing for exactly the failed reviewers spec.md §4.10
+    says must still get a footer row — and it would bracket a different span from
+    the group's gather, breaking FR-5's group-vs-sum comparison. The hooks own
+    token usage; this timer owns latency.
     """
     start = time.monotonic()
     try:
@@ -150,6 +170,7 @@ async def _timed_run(
             context=context,
             max_turns=REVIEWER_MAX_TURNS,  # plan.md §10, per reviewer, not shared
             run_config=run_config,
+            hooks=hooks,
         )
     finally:
         elapsed[reviewer] = time.monotonic() - start
@@ -216,11 +237,16 @@ async def run_all_reviewers(
     ]
 
     elapsed: dict[str, float] = {}
+    # One run-level hooks instance per reviewer run (plan.md §7), so each
+    # reviewer's usage is read from its own run context, never a shared counter.
+    run_hooks = {name: ReviewerRunHooks() for name, _agent in agents_by_name}
 
     group_start = time.monotonic()
     results = await asyncio.gather(
         *(
-            _timed_run(name, agent, diff_text, context, run_config, elapsed)
+            _timed_run(
+                name, agent, diff_text, context, run_config, elapsed, run_hooks[name]
+            )
             for name, agent in agents_by_name
         ),
         # Required by plan.md §5: one reviewer's exception must not cancel the
@@ -230,8 +256,18 @@ async def run_all_reviewers(
     group_elapsed = time.monotonic() - group_start
 
     outcomes: list[ReviewerOutcome] = []
-    for (name, _agent), result in zip(agents_by_name, results):
+    for (name, agent), result in zip(agents_by_name, results):
         elapsed_ms = round(elapsed.get(name, 0.0) * 1000)
+        # Read after the run, success or failure: the hooks hold a live reference
+        # to the run's Usage, so a reviewer that raised mid-run still reports the
+        # tokens it genuinely spent (spec.md §4.10's failed-reviewer edge case).
+        stats = run_hooks[name].stats
+        observed = {
+            "tokens": stats.tokens,
+            "llm_calls": stats.llm_calls,
+            "tool_calls": stats.tool_calls,
+            "agent_events": list(getattr(agent.hooks, "events", [])),
+        }
         if isinstance(result, BaseException):
             outcomes.append(
                 ReviewerOutcome(
@@ -240,6 +276,7 @@ async def run_all_reviewers(
                     elapsed_ms=elapsed_ms,
                     failed=True,
                     error=_describe_failure(result),
+                    **observed,
                 )
             )
             continue
@@ -251,6 +288,7 @@ async def run_all_reviewers(
                 elapsed_ms=elapsed_ms,
                 failed=problem is not None,
                 error=problem,
+                **observed,
             )
         )
 

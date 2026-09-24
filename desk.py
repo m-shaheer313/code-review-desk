@@ -134,13 +134,16 @@ def desk_input(findings: list[Finding], critical_security_present: bool) -> str:
 
 def build_footer(group: GroupOutcome) -> list[ReviewerFooterRow]:
     """One row per reviewer, from the run's own measurements (never the model's).
-    `tokens` stays 0 until FR-10's hooks supply real usage — Article VII.3 forbids
-    inventing it, so 0 means "not measured yet"."""
+
+    `tokens` comes from the run-level hooks' live reference to each run's Usage
+    (FR-10, Article VII.3); None when the hooks never saw that run's context. A
+    failed reviewer still gets its row, with whatever it genuinely spent.
+    """
     return [
         ReviewerFooterRow(
             reviewer=outcome.reviewer,
             ms=outcome.elapsed_ms,
-            tokens=0,  # TODO(FR-10): real usage from the run-level hooks
+            tokens=outcome.tokens,
             partial=outcome.failed,
         )
         for outcome in group.outcomes

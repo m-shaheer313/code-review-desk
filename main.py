@@ -73,7 +73,8 @@ def print_report(report: Report) -> None:
     print()
     print("reviewer            ms  tokens  partial")
     for row in report.footer:
-        print(f"  {row.reviewer:17} {row.ms:6} {row.tokens:7}  {row.partial}")
+        tokens = "—" if row.tokens is None else row.tokens
+        print(f"  {row.reviewer:17} {row.ms:6} {tokens:>7}  {row.partial}")
 
     if report.notes:
         print()
