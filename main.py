@@ -21,6 +21,7 @@ from agents.exceptions import OutputGuardrailTripwireTriggered
 
 from config import ConfigError, load_config
 from guardrail import REFUSAL_MESSAGE, ReportRefused
+from ledger import register_ledger
 from report import Report
 from review_context import ReviewContext
 
@@ -135,6 +136,10 @@ async def main() -> int:
     if read_error is not None:
         print(read_error)
         return 1
+
+    # FR-11: the ledger's single registration line. Delete it and the ledger is
+    # off — no agent or reviewer file needs to change.
+    register_ledger()
 
     return await _show_or_refuse(diff_text)
 

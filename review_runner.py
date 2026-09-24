@@ -17,8 +17,12 @@ is clearly larger.
 """
 
 import asyncio
+import sys
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 
 from agents import Agent, RunConfig, Runner
 from agents.exceptions import MaxTurnsExceeded
@@ -65,6 +69,9 @@ class ReviewerOutcome:
     # FR-10's agent-level event log. Populated only for an agent that carries
     # agent-level hooks (Security); empty for the other two by design.
     agent_events: list[AgentEvent] = field(default_factory=list)
+    # Wall-clock UTC time this reviewer's run ended (success or failure), for the
+    # ledger's `ts` (FR-11). Taken per run, since the three end at different times.
+    finished_at: datetime | None = None
 
 
 @dataclass
@@ -73,6 +80,10 @@ class GroupOutcome:
 
     outcomes: list[ReviewerOutcome]
     group_elapsed_ms: int
+    # One identifier per whole review, shared by all three reviewer runs, so the
+    # ledger's three lines trace back to one review (FR-11). FR-13 will reuse it
+    # as the trace grouping key (plan.md §12).
+    request_id: str = ""
 
     @property
     def sum_individual_ms(self) -> int:
@@ -147,6 +158,7 @@ async def _timed_run(
     run_config: RunConfig,
     elapsed: dict[str, float],
     hooks: ReviewerRunHooks,
+    finished_at: dict[str, datetime],
 ):
     """Run one reviewer, recording its own elapsed time.
 
@@ -174,6 +186,7 @@ async def _timed_run(
         )
     finally:
         elapsed[reviewer] = time.monotonic() - start
+        finished_at[reviewer] = datetime.now(timezone.utc)
 
 
 def _describe_failure(exc: BaseException) -> str:
@@ -213,17 +226,68 @@ def _findings_from(result, reviewer: str) -> tuple[list[Finding], str | None]:
     return [], f"reviewer returned {type(output).__name__}, expected list[Finding]"
 
 
+ReviewerRunObserver = Callable[[str, ReviewerOutcome], None]
+
+# Infrastructure that wants to see every reviewer run (FR-11's ledger) registers
+# here from the entry point. This module never names any observer, and no agent
+# definition knows the list exists: an empty list means reviews run exactly as
+# they would without it.
+_run_observers: list[ReviewerRunObserver] = []
+
+
+def add_run_observer(observer: ReviewerRunObserver) -> Callable[[], None]:
+    """Register `observer(request_id, outcome)` to be called once per reviewer run.
+
+    Idempotent — registering the same observer twice still calls it once — and
+    returns a function that removes it again.
+    """
+    if observer not in _run_observers:
+        _run_observers.append(observer)
+
+    def remove() -> None:
+        if observer in _run_observers:
+            _run_observers.remove(observer)
+
+    return remove
+
+
+def _notify_run_observers(request_id: str, outcome: ReviewerOutcome) -> None:
+    """Observers are optional infrastructure: one that fails must never fail the
+    review it is watching (Article VIII.1). Reported on stderr, never raised."""
+    for observer in list(_run_observers):
+        try:
+            observer(request_id, outcome)
+        except Exception as exc:  # noqa: BLE001 — isolation is the whole point
+            print(
+                f"run observer failed ({type(exc).__name__}: {exc}); review continues",
+                file=sys.stderr,
+            )
+
+
+def new_request_id() -> str:
+    """One per whole review (FR-11): `rev_` plus a uuid4, never one per run."""
+    return f"rev_{uuid.uuid4().hex}"
+
+
 async def run_all_reviewers(
     diff_text: str,
     context: ReviewContext,
     run_config: RunConfig | None = None,
+    request_id: str | None = None,
 ) -> GroupOutcome:
     """Launch all three reviewers concurrently over the same diff (FR-5).
 
     Never raises for a reviewer-level failure: a reviewer that raises, times out,
     or exceeds its turn ceiling contributes an empty findings list and is marked
     failed, while the other two run to completion.
+
+    `request_id` identifies this review; one is generated if the caller has none.
+    Every reviewer run in this group is reported to registered run observers under
+    that one id — including failed runs, which keep their line like they keep
+    their footer row (FR-10).
     """
+    if request_id is None:
+        request_id = new_request_id()
     # FR-13 will pass a configured RunConfig carrying the review's trace
     # grouping. Until then, default to tracing off so this needs no backend —
     # set at the run level, never as a global (Article I.2).
@@ -237,6 +301,7 @@ async def run_all_reviewers(
     ]
 
     elapsed: dict[str, float] = {}
+    finished_at: dict[str, datetime] = {}
     # One run-level hooks instance per reviewer run (plan.md §7), so each
     # reviewer's usage is read from its own run context, never a shared counter.
     run_hooks = {name: ReviewerRunHooks() for name, _agent in agents_by_name}
@@ -245,7 +310,14 @@ async def run_all_reviewers(
     results = await asyncio.gather(
         *(
             _timed_run(
-                name, agent, diff_text, context, run_config, elapsed, run_hooks[name]
+                name,
+                agent,
+                diff_text,
+                context,
+                run_config,
+                elapsed,
+                run_hooks[name],
+                finished_at,
             )
             for name, agent in agents_by_name
         ),
@@ -267,6 +339,7 @@ async def run_all_reviewers(
             "llm_calls": stats.llm_calls,
             "tool_calls": stats.tool_calls,
             "agent_events": list(getattr(agent.hooks, "events", [])),
+            "finished_at": finished_at.get(name),
         }
         if isinstance(result, BaseException):
             outcomes.append(
@@ -292,4 +365,13 @@ async def run_all_reviewers(
             )
         )
 
-    return GroupOutcome(outcomes=outcomes, group_elapsed_ms=round(group_elapsed * 1000))
+    # After classification, so observers see final values: stamped findings,
+    # failure already decided, manual-timer latency. One call per reviewer run.
+    for outcome in outcomes:
+        _notify_run_observers(request_id, outcome)
+
+    return GroupOutcome(
+        outcomes=outcomes,
+        group_elapsed_ms=round(group_elapsed * 1000),
+        request_id=request_id,
+    )
