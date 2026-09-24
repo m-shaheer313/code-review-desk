@@ -302,7 +302,19 @@ def build_base_reviewer() -> Agent[ReviewContext]:
 
 def build_style_reviewer() -> Agent[ReviewContext]:
     """Style Reviewer: a clone of Base with per-run instructions and the ruleset
-    tool. The forced `get_ruleset` call (FR-9a) is deliberately not wired yet."""
+    tool, whose call is FORCED (FR-9a, plan.md §9).
+
+    `tool_choice` names `get_ruleset` specifically. "required" would only force
+    *some* tool call — with more tools later, the model could satisfy it without
+    ever reading the ruleset. The name is taken from the tool object rather than
+    typed as a literal, so renaming the tool cannot silently unpin it.
+
+    `reset_tool_choice=True` is load-bearing, not decoration: it drops the forced
+    choice back to "auto" after the first tool call. Without it, the model would
+    be forced to call `get_ruleset` on every turn, could never emit its findings,
+    and every Style run would end in MaxTurnsExceeded. It is the SDK default; it is
+    set explicitly so nobody "simplifies" it away.
+    """
     return build_base_reviewer().clone(
         name=STYLE_REVIEWER_NAME,
         instructions=_style_instructions_for_run,
@@ -311,7 +323,9 @@ def build_style_reviewer() -> Agent[ReviewContext]:
         model_settings=ModelSettings(
             temperature=STYLE_TEMPERATURE,
             max_tokens=STYLE_MAX_TOKENS,
+            tool_choice=get_ruleset.name,
         ),
+        reset_tool_choice=True,
     )
 
 

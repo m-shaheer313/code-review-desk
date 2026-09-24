@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 from agents import Agent, RunConfig, Runner
+from agents.exceptions import MaxTurnsExceeded
 
 from config import REVIEWER_MAX_TURNS, build_model
 from finding import Finding
@@ -154,6 +155,22 @@ async def _timed_run(
         elapsed[reviewer] = time.monotonic() - start
 
 
+def _describe_failure(exc: BaseException) -> str:
+    """User-facing reason a reviewer contributed nothing (no traceback).
+
+    A turn-ceiling hit is called out by name as a partial review (spec.md §4.9's
+    9c, Article VI.2) rather than surfacing as a bare exception string — the user
+    should read "this reviewer ran out of turns", not "something broke".
+    """
+    if isinstance(exc, MaxTurnsExceeded):
+        return (
+            f"stopped at its {REVIEWER_MAX_TURNS}-turn ceiling before producing "
+            "findings (MaxTurnsExceeded); its findings are missing from this "
+            "partial review"
+        )
+    return f"{type(exc).__name__}: {exc}".strip()
+
+
 def _findings_from(result, reviewer: str) -> tuple[list[Finding], str | None]:
     """Extract `list[Finding]` from a RunResult, defensively, stamping the source.
 
@@ -222,7 +239,7 @@ async def run_all_reviewers(
                     findings=[],
                     elapsed_ms=elapsed_ms,
                     failed=True,
-                    error=f"{type(result).__name__}: {result}".strip(),
+                    error=_describe_failure(result),
                 )
             )
             continue
