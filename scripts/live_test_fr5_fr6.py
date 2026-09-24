@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from agents import RunConfig  # noqa: E402
 
 import desk  # noqa: E402
-from config import CHEAP_MODEL_NAME, ConfigError, MODEL_NAME, build_model  # noqa: E402
+from config import CHEAP_MODEL_NAME, ConfigError, MODEL_NAME, build_model, configure_tracing  # noqa: E402
+from review_runner import trace_id_for  # noqa: E402
 from remediation import decide_needs_remediation  # noqa: E402
 from review_context import ReviewContext  # noqa: E402
 from review_runner import run_all_reviewers as real_run_all_reviewers  # noqa: E402
@@ -101,11 +102,12 @@ async def main() -> int:
     # differs, and no agent definition changes (Article I.3).
     use_cheap = "--cheap" in sys.argv
     model_in_use = CHEAP_MODEL_NAME if use_cheap else MODEL_NAME
-    run_config = RunConfig(tracing_disabled=True)
+    # FR-13: tracing ON — this run's trace is the visual proof of FR-5 (the
+    # three reviewer spans should overlap). The trace id is printed at the end.
+    configure_tracing()
+    run_config = RunConfig()
     if use_cheap:
-        run_config = RunConfig(
-            tracing_disabled=True, model=build_model(CHEAP_MODEL_NAME)
-        )
+        run_config = RunConfig(model=build_model(CHEAP_MODEL_NAME))
 
     rule("RUNNING ONE LIVE REVIEW")
     print(f"model: {model_in_use}" + ("  (FR-7 run-level override)" if use_cheap else ""))
@@ -190,7 +192,15 @@ async def main() -> int:
         print("  (none)")
     print(f"\n  report.is_partial: {report.is_partial}")
 
-    rule("FOOTER (FR-10 stub: tokens still 0)")
+    rule("FR-13 — TRACE")
+    if group is not None:
+        trace_id = trace_id_for(group.request_id)
+        print(f"  request_id : {group.request_id}")
+        print(f"  trace_id   : {trace_id}")
+        print(f"  open it at : https://platform.openai.com/traces/trace?trace_id={trace_id}")
+        print("  (exported in the background; allow a few seconds before opening)")
+
+    rule("FOOTER")
     for row in report.footer:
         print(
             f"  {row.reviewer:17} ms={row.ms:6} tokens={row.tokens} partial={row.partial}"

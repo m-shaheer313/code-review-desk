@@ -35,7 +35,7 @@ instructions tell it to emit an empty footer.
 
 import json
 
-from agents import Agent, ModelSettings, RunConfig, Runner
+from agents import Agent, ModelSettings, RunConfig, Runner, trace
 from agents.exceptions import AgentsException, OutputGuardrailTripwireTriggered
 from openai import APIStatusError
 
@@ -50,7 +50,15 @@ from remediation import (
 )
 from report import Report, ReviewerFooterRow
 from review_context import ReviewContext
-from review_runner import GroupOutcome, ReviewerDoneCallback, run_all_reviewers
+from review_runner import (
+    REVIEW_WORKFLOW_NAME,
+    GroupOutcome,
+    ReviewerDoneCallback,
+    new_request_id,
+    review_run_config,
+    run_all_reviewers,
+    trace_id_for,
+)
 from reviewers import SECURITY_REVIEWER_NAME, shared_model
 
 DESK_NAME = "Desk"
@@ -98,12 +106,17 @@ DESK_INSTRUCTIONS = (
 )
 
 
-def build_desk() -> Agent[ReviewContext]:
+def build_desk(run_config: RunConfig | None = None) -> Agent[ReviewContext]:
     """The Desk agent (plan.md §2).
 
     Merge is a real tool the model chooses to call; Remediation is a real handoff
     target; FR-8's guardrail runs on the way out. Static instructions — the Desk's
     job is orchestration, not per-turn personalization.
+
+    `run_config` is the review's grouped config (FR-13). It is handed to the
+    Merge tool, whose nested Runner.run would otherwise start from a bare
+    default; the Remediation handoff needs nothing, since a handoff is part of
+    the Desk's own run.
     """
     return Agent[ReviewContext](
         name=DESK_NAME,
@@ -113,7 +126,7 @@ def build_desk() -> Agent[ReviewContext]:
             temperature=DESK_TEMPERATURE,
             max_tokens=DESK_MAX_TOKENS,
         ),
-        tools=[as_merge_tool()],
+        tools=[as_merge_tool(run_config=run_config)],
         handoffs=[build_remediation_specialist()],
         output_type=Report,
         output_guardrails=[credential_output_guardrail],
@@ -240,12 +253,8 @@ async def run_review(
     `report` is None only when there is nothing to review at all; every other
     failure degrades into a partial report with a note (Article VIII.3).
     """
-    if run_config is None:
-        # FR-13 will supply a configured RunConfig carrying this review's trace
-        # grouping; until then tracing is off, set per run, never globally.
-        run_config = RunConfig(tracing_disabled=True)
-
-    # (a) FR-1 — deterministic, upstream of any model.
+    # (a) FR-1 — deterministic, upstream of any model. Nothing to review means
+    # no trace: there is no model activity to record.
     chunks, split_error = split_diff_by_file(diff_text)
     if split_error is not None:
         return None, split_error
@@ -258,12 +267,46 @@ async def run_review(
         skipped = [c["file"] for c in chunks if not c["has_text_changes"]]
         notes.append(f"no reviewable text changes: {', '.join(skipped)}")
 
+    # FR-13 — ONE id for the whole review, generated before the gather (plan.md
+    # §12). The ledger (FR-11) uses the same id, so a ledger line names its trace.
+    request_id = new_request_id()
+    review_config = review_run_config(request_id, run_config)
+
+    # The one trace for this review. Every Runner.run started inside it — the
+    # three concurrent reviewers (asyncio tasks inherit the active trace through
+    # their context), the Desk, the Merge tool's nested run, the Remediation
+    # handoff — joins this trace instead of starting its own. That is what makes
+    # it one trace; `group_id` on the individual configs alone would only group
+    # several separate traces together.
+    with trace(
+        REVIEW_WORKFLOW_NAME,
+        trace_id=trace_id_for(request_id),
+        group_id=request_id,
+        metadata={"request_id": request_id},
+        disabled=review_config.tracing_disabled,
+    ):
+        return await _review_in_trace(
+            reviewable, context, review_config, request_id, notes, on_reviewer_done
+        )
+
+
+async def _review_in_trace(
+    reviewable: list[dict],
+    context: ReviewContext,
+    review_config: RunConfig,
+    request_id: str,
+    notes: list[str],
+    on_reviewer_done: ReviewerDoneCallback | None,
+) -> tuple[Report | None, str | None]:
+    """Steps (b)-(g) of one review, run inside that review's trace."""
+    run_config = review_config
     # (b) FR-5 — deterministic, one gather, upstream of the Desk's run.
     review_input = "\n".join(chunk["diff_text"] for chunk in reviewable)
     group = await run_all_reviewers(
         review_input,
         context,
         run_config=run_config,
+        request_id=request_id,
         on_reviewer_done=on_reviewer_done,
     )
     notes.extend(
@@ -279,7 +322,7 @@ async def run_review(
     # (c)-(f) The Desk's own run: merge as a tool call, remediation as a handoff.
     try:
         result = await Runner.run(
-            build_desk(),
+            build_desk(run_config),
             desk_input(raw_findings, critical_present),
             context=context,
             max_turns=DESK_MAX_TURNS,

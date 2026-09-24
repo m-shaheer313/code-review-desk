@@ -19,7 +19,13 @@ from agents import RunConfig, Runner  # noqa: E402
 from agents.exceptions import AgentsException  # noqa: E402
 from openai import APIStatusError  # noqa: E402
 
-from config import CHEAP_MODEL_NAME, ConfigError, MODEL_NAME, REVIEWER_MAX_TURNS  # noqa: E402
+from config import (  # noqa: E402
+    CHEAP_MODEL_NAME,
+    ConfigError,
+    MODEL_NAME,
+    REVIEWER_MAX_TURNS,
+    configure_tracing,
+)
 from review_context import ReviewContext  # noqa: E402
 from review_runner import run_reviewer_with_override  # noqa: E402
 from reviewers import build_style_reviewer  # noqa: E402
@@ -57,6 +63,7 @@ def show(label: str, model_name: str, outcome) -> None:
 
 async def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    configure_tracing()  # FR-13: tracing on
 
     context = ReviewContext(
         repo="billing-service",
@@ -83,7 +90,7 @@ async def main() -> int:
             DIFF,
             context=context,
             max_turns=REVIEWER_MAX_TURNS,
-            run_config=RunConfig(tracing_disabled=True),
+            run_config=RunConfig(),
         )
         own_outcome = result.final_output
     except APIStatusError as exc:

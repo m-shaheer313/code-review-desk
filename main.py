@@ -19,7 +19,7 @@ from pathlib import Path
 
 from agents.exceptions import OutputGuardrailTripwireTriggered
 
-from config import ConfigError, load_config
+from config import ConfigError, configure_tracing, load_config
 from guardrail import REFUSAL_MESSAGE, ReportRefused
 from ledger import register_ledger
 from report import Report
@@ -127,6 +127,10 @@ async def main() -> int:
         # Validates GEMINI_API_KEY now, so a misconfigured run fails before any
         # work rather than halfway through a review (Article II.3).
         load_config()
+        # FR-13 / Article VII.1: traces export under the developer's own key.
+        # The same call the browser path makes (chat_session.handle_message) —
+        # one setup function, two entry points.
+        configure_tracing()
     except ConfigError as exc:
         print(str(exc))
         return 1

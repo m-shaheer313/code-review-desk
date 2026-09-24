@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 
-from agents import OpenAIChatCompletionsModel
+from agents import OpenAIChatCompletionsModel, set_tracing_export_api_key
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -44,6 +44,11 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 REVIEWER_MAX_TURNS = 6
 
 API_KEY_VAR = "GEMINI_API_KEY"
+
+# FR-13 — see `configure_tracing`.
+TRACING_KEY_VAR = "TRACING_EXPORT_KEY"
+OPENAI_KEY_PREFIX = "sk-"
+GEMINI_KEY_PREFIX = "AIza"
 
 # See `Config.build_client`. Kept deliberately low: the SDK's backoff caps at a
 # few seconds, so aggressive retrying against a per-minute quota makes things
@@ -102,6 +107,44 @@ def build_model(model_name: str) -> OpenAIChatCompletionsModel:
         model=model_name,
         openai_client=config.build_client(),
     )
+
+
+def configure_tracing() -> None:
+    """Point the SDK's trace exporter at the developer's own key (FR-13, Article
+    VII.1). Call once at startup, from each entry point; safe to call again.
+
+    Mechanism: `agents.set_tracing_export_api_key(key)`, the SDK's setter for the
+    exporter's key. Without it the exporter falls back to OPENAI_API_KEY, which
+    this project does not set — traces would be silently dropped.
+
+    The key must be an OpenAI key (`sk-...`), not the Gemini key: the exporter
+    ships traces to OpenAI's platform no matter which model answered the review.
+    A Gemini-shaped key is rejected by name rather than failing later as an opaque
+    401 in a background thread. The key's value is never included in any message
+    (Article II.4).
+
+    Raises `ConfigError` with one clear line if the key is missing, empty, or the
+    wrong shape (Article II.3) — tracing is required, not optional.
+    """
+    load_dotenv()
+    key = (os.getenv(TRACING_KEY_VAR) or "").strip()
+    if not key:
+        raise ConfigError(
+            f"{TRACING_KEY_VAR} is missing or empty. Add a line "
+            f"'{TRACING_KEY_VAR}=<your OpenAI key, sk-...>' to the .env file at the "
+            f"project root (see .env.example)."
+        )
+    if key.startswith(GEMINI_KEY_PREFIX):
+        raise ConfigError(
+            f"{TRACING_KEY_VAR} looks like a Gemini API key. Traces are exported to "
+            f"OpenAI's platform, so this must be an OpenAI key (it starts with sk-)."
+        )
+    if not key.startswith(OPENAI_KEY_PREFIX):
+        raise ConfigError(
+            f"{TRACING_KEY_VAR} does not look like an OpenAI API key (expected it to "
+            f"start with sk-). Traces are exported to OpenAI's platform."
+        )
+    set_tracing_export_api_key(key)
 
 
 def load_config() -> Config:

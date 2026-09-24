@@ -136,9 +136,9 @@ async def run_reviewer_with_override(
     """
     override_model = build_model(model_name)
     if run_config is None:
-        # Matches the rest of the codebase: tracing off until FR-13 supplies a
-        # configured RunConfig. Set per run, never globally.
-        run_config = RunConfig(tracing_disabled=True)
+        # Tracing ON (Article VII.1). A standalone second opinion is its own
+        # trace; a caller inside a review passes that review's config instead.
+        run_config = RunConfig()
     # `replace` keeps any trace grouping the caller set up and swaps only the model.
     run_config = replace(run_config, model=override_model)
 
@@ -338,6 +338,39 @@ def new_request_id() -> str:
     return f"rev_{uuid.uuid4().hex}"
 
 
+# FR-13 — tracing. One review is one trace, keyed off its request_id.
+REVIEW_WORKFLOW_NAME = "Code Review Desk review"
+
+
+def trace_id_for(request_id: str) -> str:
+    """The review's trace id, derived from its request_id: `rev_<hex>` becomes
+    `trace_<hex>` (the SDK's `trace_` + 32-hex shape). A ledger line therefore
+    names the trace it belongs to — no lookup table needed."""
+    return "trace_" + request_id.removeprefix("rev_")
+
+
+def review_run_config(request_id: str, base: RunConfig | None = None) -> RunConfig:
+    """A NEW RunConfig for one run inside the review `request_id`.
+
+    Always a fresh instance (`dataclasses.replace` copies), so concurrent reviewer
+    runs never share one mutable RunConfig. Every copy carries the same
+    `group_id=request_id` and workflow name; everything else — a FR-7 model
+    override, `tracing_disabled` in tests — is kept from `base`.
+
+    What actually makes the review ONE trace is the `trace(...)` context that
+    `desk.run_review` opens around it: a Runner.run started while a trace is
+    active joins that trace instead of creating its own. `group_id` here is the
+    backstop — any run that did end up outside the trace still lands in the same
+    group — and it is what these configs are checked on.
+    """
+    return replace(
+        base if base is not None else RunConfig(),
+        workflow_name=REVIEW_WORKFLOW_NAME,
+        group_id=request_id,
+        trace_metadata={"request_id": request_id},
+    )
+
+
 async def run_all_reviewers(
     diff_text: str,
     context: ReviewContext,
@@ -364,17 +397,20 @@ async def run_all_reviewers(
     """
     if request_id is None:
         request_id = new_request_id()
-    # FR-13 will pass a configured RunConfig carrying the review's trace
-    # grouping. Until then, default to tracing off so this needs no backend —
-    # set at the run level, never as a global (Article I.2).
-    if run_config is None:
-        run_config = RunConfig(tracing_disabled=True)
 
     agents_by_name: list[tuple[str, Agent[ReviewContext]]] = [
         (SECURITY, build_security_reviewer()),
         (TESTS, build_tests_reviewer()),
         (STYLE, build_style_reviewer()),
     ]
+
+    # FR-13: one RunConfig INSTANCE per reviewer, all built here, before the
+    # gather starts, from the one request_id — so the three concurrent runs never
+    # share a mutable config, and none can pick up a different id. Tracing is on
+    # unless the caller's base config explicitly turns it off (tests do).
+    run_configs = {
+        name: review_run_config(request_id, run_config) for name, _agent in agents_by_name
+    }
 
     elapsed: dict[str, float] = {}
     finished_at: dict[str, datetime] = {}
@@ -393,7 +429,7 @@ async def run_all_reviewers(
                 agent,
                 diff_text,
                 context,
-                run_config,
+                run_configs[name],
                 elapsed,
                 run_hooks[name],
                 finished_at,

@@ -27,7 +27,7 @@ from typing import Any, Protocol
 from agents.exceptions import OutputGuardrailTripwireTriggered
 
 import desk
-from config import ConfigError
+from config import ConfigError, configure_tracing
 from guardrail import REFUSAL_MESSAGE, ReportRefused
 from report import Report
 from review_context import ReviewContext
@@ -206,6 +206,10 @@ async def handle_message(
         await send(render_progress(outcome))
 
     try:
+        # FR-13: same setup call as main.py. Idempotent, so running it per review
+        # is harmless, and a missing/wrong key becomes one plain message here
+        # rather than a startup traceback in the browser (Article VIII.2).
+        configure_tracing()
         report, error = await run(diff_text, context, on_reviewer_done=on_reviewer_done)
     except (ReportRefused, OutputGuardrailTripwireTriggered):
         store.set(REPORT_KEY, None)
