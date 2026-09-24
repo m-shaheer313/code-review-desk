@@ -45,13 +45,13 @@ graph TD
 
 | Agent | Role | Model | Instructions | Output type | Handoff targets |
 |---|---|---|---|---|---|
-| **Desk** | Entry point: splits diff, launches reviewers concurrently, calls Merge, decides on Remediation | `gemini-2.5-flash` (see constitution.md Article I.1 note), moderate temperature (e.g. 0.3) | Static — the Desk's job is orchestration, not per-turn personalization | `Report` | Remediation Specialist |
-| **Base Reviewer** | Not exposed; exists only to be cloned | `gemini-2.5-flash`, baseline settings | Generic placeholder, always overridden | `list[Finding]` | none |
+| **Desk** | Entry point: splits diff, launches reviewers concurrently, calls Merge, decides on Remediation | `gemini-3.6-flash` (see constitution.md Article I.1 note), moderate temperature (e.g. 0.3) | Static — the Desk's job is orchestration, not per-turn personalization | `Report` | Remediation Specialist |
+| **Base Reviewer** | Not exposed; exists only to be cloned | `gemini-3.6-flash`, baseline settings | Generic placeholder, always overridden | `list[Finding]` | none |
 | **Security Reviewer** | Vulnerabilities, unsafe patterns, credential-shaped strings in the diff | Cloned from Base; low temperature (e.g. 0.1) for precision | Built per-run from `ReviewContext` (FR-4); focuses on security-relevant patterns | `list[Finding]` | none (leaf) |
 | **Tests Reviewer** | Missing/weakened test coverage implied by the diff | Cloned from Base; moderate temperature (e.g. 0.2) | Built per-run from `ReviewContext` | `list[Finding]` | none (leaf) |
 | **Style Reviewer** | Ruleset violations — naming, formatting, structure | Cloned from Base; low temperature (e.g. 0.1) for consistency | Built per-run from `ReviewContext`; terser when `strictness == "strict"` | `list[Finding]` | none (leaf) |
-| **Merge Specialist** | Deduplicates and orders findings by severity | `gemini-2.5-flash`, low temperature | Single-purpose: merge, dedupe, order — never adds new findings | plain structured data (not a handoff target — a tool) | — |
-| **Remediation Specialist** | Proposes a fix for a critical security finding | `gemini-2.5-flash`, moderate temperature | Receives the critical finding(s); proposes a patch, never applies it (NG-2) | text/patch proposal | none (leaf) |
+| **Merge Specialist** | Deduplicates and orders findings by severity | `gemini-3.6-flash`, low temperature | Single-purpose: merge, dedupe, order — never adds new findings | plain structured data (not a handoff target — a tool) | — |
+| **Remediation Specialist** | Proposes a fix for a critical security finding | `gemini-3.6-flash`, moderate temperature | Receives the critical finding(s); proposes a patch, never applies it (NG-2) | text/patch proposal | none (leaf) |
 
 **Design decision — why Merge is a tool and Remediation is a handoff (spec.md §4.6's required
 justification, restated here for the architecture record).** Merge's output is consumed and
