@@ -4,11 +4,12 @@ Line shape, plan.md §4.4:
     {"ts": "2026-09-23T19:04:11Z", "request_id": "rev_...", "agent": "SecurityReviewer",
      "ms": 2140, "findings": 3}
 
-This is optional infrastructure. `register_ledger()` is called once, from the entry
-point, and plugs a writer into `review_runner`'s run observers. Nothing else in
-the codebase imports this module — no agent, no reviewer, not the runner — so
-deleting that one registration call switches the ledger off and changes nothing
-else (FR-11's acceptance criterion).
+This is optional infrastructure. `register_ledger()` is called once per process,
+from each entry point — `main.py` for the terminal, `app.py`'s `on_app_startup` for
+the browser — the same call in both, and plugs a writer into `review_runner`'s run
+observers. Nothing else imports this module — no agent, no reviewer, not the
+runner — so deleting an entry point's one registration call switches the ledger
+off for that entry point and changes nothing else (FR-11's acceptance criterion).
 
 What a line never contains (Article II.4): finding messages, file paths, model
 output or diff text. A reviewer name, a duration and a count cannot leak a
@@ -17,6 +18,7 @@ credential found in a reviewed diff.
 
 import json
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +45,24 @@ def ledger_line(request_id: str, outcome: ReviewerOutcome) -> dict:
     }
 
 
+# Serializes ledger appends WITHIN THIS PROCESS (FR-12 made this necessary: one
+# Chainlit process serves many browser sessions, so two reviews can finish at the
+# same moment). One module-level lock for every writer, since two writers
+# pointed at the same file must also exclude each other.
+#
+# Honest scope of what this protects:
+# - Coroutines on one event loop cannot interleave a *synchronous* open/write/close
+#   anyway — nothing awaits in the middle of it. The lock is what protects the case
+#   that actually can interleave in one process: appends from different threads
+#   (Chainlit worker threads, `cl.make_async`, a threaded server).
+# - It does NOTHING across processes. Running `main.py` and Chainlit at the same
+#   time against the same `ledger.jsonl` is still unprotected: each process has its
+#   own lock, and Windows does not guarantee an append lands atomically. That is a
+#   known, separate limitation — it would need an OS-level file lock
+#   (msvcrt.locking / fcntl.flock) or one writer process — and it is not fixed here.
+_WRITE_LOCK = threading.Lock()
+
+
 class LedgerWriter:
     """Appends one line per reviewer run to `path`. Never raises: a ledger that
     cannot be written is reported on stderr and the review carries on."""
@@ -54,7 +74,9 @@ class LedgerWriter:
         line = json.dumps(ledger_line(request_id, outcome), separators=(", ", ": "))
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
+            # One whole line per lock hold: open, write the line and its newline
+            # together, close. Another thread's line can only land before or after.
+            with _WRITE_LOCK, self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
         except OSError as exc:
             print(

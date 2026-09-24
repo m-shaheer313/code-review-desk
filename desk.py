@@ -50,7 +50,7 @@ from remediation import (
 )
 from report import Report, ReviewerFooterRow
 from review_context import ReviewContext
-from review_runner import GroupOutcome, run_all_reviewers
+from review_runner import GroupOutcome, ReviewerDoneCallback, run_all_reviewers
 from reviewers import SECURITY_REVIEWER_NAME, shared_model
 
 DESK_NAME = "Desk"
@@ -184,7 +184,11 @@ def _report_from_run(result, raw_findings: list[Finding]) -> tuple[Report, list[
     last_agent = getattr(getattr(result, "last_agent", None), "name", None)
 
     if isinstance(output, Report):
-        return output, notes
+        # A deep copy, because run_review goes on to overwrite footer and notes.
+        # Mutating the object the run handed back would alias it with whoever
+        # else holds it — found by FR-12's two-session test, where one session's
+        # review rewrote the other session's stored report.
+        return output.model_copy(deep=True), notes
 
     if isinstance(output, str) and output.strip():
         if last_agent != REMEDIATION_SPECIALIST_NAME:
@@ -219,13 +223,19 @@ async def run_review(
     diff_text: str,
     context: ReviewContext,
     run_config: RunConfig | None = None,
+    on_reviewer_done: ReviewerDoneCallback | None = None,
 ) -> tuple[Report | None, str | None]:
     """Run one whole review. Returns `(report, error_message)`.
 
     Raises `ReportRefused` or `OutputGuardrailTripwireTriggered` when the report
-    cannot be shown (FR-8). Both are caught at the single top-level entry point in
-    `main.py` — deliberately NOT caught here, so there is exactly one place in the
-    program that decides what the user sees on a refusal.
+    cannot be shown (FR-8). Both are caught at the top of each entry point —
+    `main.py` for the terminal, `app.py` for the browser — and deliberately NOT
+    here, so each entry point has exactly one place deciding what its user sees.
+
+    `on_reviewer_done`, if given, receives each reviewer's raw outcome as that
+    reviewer finishes (FR-12) — before merging, the Desk, or the guardrail. It
+    carries counts and timings for progress display; showing finding *text* from
+    it would bypass FR-8's check on the finished report.
 
     `report` is None only when there is nothing to review at all; every other
     failure degrades into a partial report with a note (Article VIII.3).
@@ -250,7 +260,12 @@ async def run_review(
 
     # (b) FR-5 — deterministic, one gather, upstream of the Desk's run.
     review_input = "\n".join(chunk["diff_text"] for chunk in reviewable)
-    group = await run_all_reviewers(review_input, context, run_config=run_config)
+    group = await run_all_reviewers(
+        review_input,
+        context,
+        run_config=run_config,
+        on_reviewer_done=on_reviewer_done,
+    )
     notes.extend(
         f"{outcome.reviewer} did not complete: {outcome.error}"
         for outcome in group.outcomes

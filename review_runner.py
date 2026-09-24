@@ -17,10 +17,11 @@ is clearly larger.
 """
 
 import asyncio
+import inspect
 import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
@@ -226,6 +227,74 @@ def _findings_from(result, reviewer: str) -> tuple[list[Finding], str | None]:
     return [], f"reviewer returned {type(output).__name__}, expected list[Finding]"
 
 
+def _outcome_for(
+    name: str,
+    agent: Agent[ReviewContext],
+    result,
+    elapsed: dict[str, float],
+    run_hooks: dict[str, ReviewerRunHooks],
+    finished_at: dict[str, datetime],
+) -> ReviewerOutcome:
+    """Classify one finished reviewer run — a RunResult or the exception it raised.
+
+    Called from inside that reviewer's own gathered coroutine as soon as it ends,
+    so the outcome is final before the other reviewers are done (FR-12). Every
+    value is already settled by then: `_timed_run`'s `finally` has recorded the
+    latency and finish time, and the run-level hooks have seen the whole run.
+    """
+    # Read after the run, success or failure: the hooks hold a live reference to
+    # the run's Usage, so a reviewer that raised mid-run still reports the tokens
+    # it genuinely spent (spec.md §4.10's failed-reviewer edge case).
+    stats = run_hooks[name].stats
+    observed = {
+        "elapsed_ms": round(elapsed.get(name, 0.0) * 1000),
+        "tokens": stats.tokens,
+        "llm_calls": stats.llm_calls,
+        "tool_calls": stats.tool_calls,
+        "agent_events": list(getattr(agent.hooks, "events", [])),
+        "finished_at": finished_at.get(name),
+    }
+    if isinstance(result, BaseException):
+        return ReviewerOutcome(
+            reviewer=name,
+            findings=[],
+            failed=True,
+            error=_describe_failure(result),
+            **observed,
+        )
+    findings, problem = _findings_from(result, name)
+    return ReviewerOutcome(
+        reviewer=name,
+        findings=findings,
+        failed=problem is not None,
+        error=problem,
+        **observed,
+    )
+
+
+ReviewerDoneCallback = Callable[[ReviewerOutcome], Awaitable[None] | None]
+
+
+async def _announce(callback: ReviewerDoneCallback | None, outcome: ReviewerOutcome) -> None:
+    """Deliver one reviewer's outcome to the streaming callback (FR-12).
+
+    Sync or async callbacks both work. A callback that fails — a browser that went
+    away mid-review, say — must not turn a finished reviewer into a failed one, so
+    it is reported on stderr and swallowed (Article VIII.1).
+    """
+    if callback is None:
+        return
+    try:
+        maybe = callback(outcome)
+        if inspect.isawaitable(maybe):
+            await maybe
+    except Exception as exc:  # noqa: BLE001 — a UI problem is not a review failure
+        print(
+            f"reviewer-done callback failed ({type(exc).__name__}: {exc}); review continues",
+            file=sys.stderr,
+        )
+
+
 ReviewerRunObserver = Callable[[str, ReviewerOutcome], None]
 
 # Infrastructure that wants to see every reviewer run (FR-11's ledger) registers
@@ -274,12 +343,19 @@ async def run_all_reviewers(
     context: ReviewContext,
     run_config: RunConfig | None = None,
     request_id: str | None = None,
+    on_reviewer_done: ReviewerDoneCallback | None = None,
 ) -> GroupOutcome:
     """Launch all three reviewers concurrently over the same diff (FR-5).
 
     Never raises for a reviewer-level failure: a reviewer that raises, times out,
     or exceeds its turn ceiling contributes an empty findings list and is marked
     failed, while the other two run to completion.
+
+    `on_reviewer_done(outcome)` (FR-12), if given, is called once per reviewer the
+    moment that reviewer finishes — in completion order, not agent-list order —
+    from inside the same single `gather`. It is awaited, so the last reviewer's
+    callback falls inside `group_elapsed_ms`; each reviewer's own `elapsed_ms` is
+    measured before the callback and is unaffected.
 
     `request_id` identifies this review; one is generated if the caller has none.
     Every reviewer run in this group is reported to registered run observers under
@@ -306,10 +382,13 @@ async def run_all_reviewers(
     # reviewer's usage is read from its own run context, never a shared counter.
     run_hooks = {name: ReviewerRunHooks() for name, _agent in agents_by_name}
 
-    group_start = time.monotonic()
-    results = await asyncio.gather(
-        *(
-            _timed_run(
+    # Filled in by each reviewer's own coroutine the moment it finishes, so the
+    # outcome exists (and can be streamed) before the other reviewers are done.
+    built: dict[str, ReviewerOutcome] = {}
+
+    async def run_and_announce(name: str, agent: Agent[ReviewContext]):
+        try:
+            result = await _timed_run(
                 name,
                 agent,
                 diff_text,
@@ -319,51 +398,28 @@ async def run_all_reviewers(
                 run_hooks[name],
                 finished_at,
             )
-            for name, agent in agents_by_name
-        ),
+        except BaseException as exc:
+            built[name] = _outcome_for(name, agent, exc, elapsed, run_hooks, finished_at)
+            await _announce(on_reviewer_done, built[name])
+            # Re-raised so `gather` still receives it: return_exceptions=True is
+            # what keeps this failure from cancelling the other two reviewers.
+            raise
+        built[name] = _outcome_for(name, agent, result, elapsed, run_hooks, finished_at)
+        await _announce(on_reviewer_done, built[name])
+        return result
+
+    group_start = time.monotonic()
+    await asyncio.gather(
+        *(run_and_announce(name, agent) for name, agent in agents_by_name),
         # Required by plan.md §5: one reviewer's exception must not cancel the
         # other two in-flight reviewers.
         return_exceptions=True,
     )
     group_elapsed = time.monotonic() - group_start
 
-    outcomes: list[ReviewerOutcome] = []
-    for (name, agent), result in zip(agents_by_name, results):
-        elapsed_ms = round(elapsed.get(name, 0.0) * 1000)
-        # Read after the run, success or failure: the hooks hold a live reference
-        # to the run's Usage, so a reviewer that raised mid-run still reports the
-        # tokens it genuinely spent (spec.md §4.10's failed-reviewer edge case).
-        stats = run_hooks[name].stats
-        observed = {
-            "tokens": stats.tokens,
-            "llm_calls": stats.llm_calls,
-            "tool_calls": stats.tool_calls,
-            "agent_events": list(getattr(agent.hooks, "events", [])),
-            "finished_at": finished_at.get(name),
-        }
-        if isinstance(result, BaseException):
-            outcomes.append(
-                ReviewerOutcome(
-                    reviewer=name,
-                    findings=[],
-                    elapsed_ms=elapsed_ms,
-                    failed=True,
-                    error=_describe_failure(result),
-                    **observed,
-                )
-            )
-            continue
-        findings, problem = _findings_from(result, name)
-        outcomes.append(
-            ReviewerOutcome(
-                reviewer=name,
-                findings=findings,
-                elapsed_ms=elapsed_ms,
-                failed=problem is not None,
-                error=problem,
-                **observed,
-            )
-        )
+    # Reported in the fixed Security, Tests, Style order regardless of which
+    # finished first — the streaming callback is where completion order lives.
+    outcomes = [built[name] for name, _agent in agents_by_name]
 
     # After classification, so observers see final values: stamped findings,
     # failure already decided, manual-timer latency. One call per reviewer run.
