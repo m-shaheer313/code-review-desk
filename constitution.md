@@ -1,6 +1,6 @@
 # Constitution — Code Review Desk
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Ratified
 **Applies to:** All source code, configuration, and documentation produced for this project.
 
@@ -19,7 +19,7 @@ as in RFC 2119.
 
 ## Article I — Model Provider and Configuration
 
-1. The Desk and its reviewers MUST use `gemini-2.5-flash` as the default underlying language
+1. The Desk and its reviewers MUST use `gemini-3.6-flash` as the default underlying language
    model, accessed through an OpenAI-compatible client, configured at the **agent level** — passed
    into each `Agent` definition's own model/client configuration.
 
