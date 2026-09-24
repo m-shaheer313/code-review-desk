@@ -26,8 +26,9 @@ as in RFC 2119.
    **Note (carried forward from the Saylani Ops Desk project):** `gemini-2.5-flash` was blocked by
    Google for new API keys/projects during that prior project, ahead of its stated retirement (not
    before Oct 16, 2026), and `gemini-3.6-flash` was the confirmed working replacement at that time.
-   Verify at Phase 0 whether the API key for *this* project can reach `gemini-2.5-flash`; if not,
-   amend this Article via Article IX using the same replacement, before writing any code.
+   **Note:** `gemini-2.5-flash` was tested against this project's API key at Phase 0 and returned
+   an error, consistent with the block observed in the Saylani Ops Desk project. The Article was
+   amended to `gemini-3.6-flash` accordingly (see commits `dd613ca`, `b486029`).
 2. `set_default_openai_client`, or any equivalent global/process-wide client override, MUST NOT
    appear anywhere in the codebase.
 3. FR-7 explicitly permits overriding the model **at the run level** for a single re-run (a
