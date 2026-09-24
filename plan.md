@@ -16,9 +16,9 @@ graph TD
     D -->|asyncio.gather, concurrent| SEC[Security Reviewer]
     D -->|asyncio.gather, concurrent| TST[Tests Reviewer]
     D -->|asyncio.gather, concurrent| STY[Style Reviewer]
-    SEC -->|tool| TOOLS[list_changed_files / get_file_diff]
-    TST -->|tool| TOOLS
-    STY -->|tool, REQUIRED| RULESET[get_ruleset]
+    SEC -->|tool, optional| RULESET[get_ruleset]
+    TST -->|tool, optional| RULESET
+    STY -->|tool, REQUIRED| RULESET
     SEC --> FSEC[list-Finding-]
     TST --> FTST[list-Finding-]
     STY --> FSTY[list-Finding-]
@@ -65,13 +65,17 @@ the reply transfers, so it is a handoff.
 | Name | Owner agent(s) | Parameters (model-supplied) | Context read internally | Returns | Failure behavior |
 |---|---|---|---|---|---|
 | `split_diff_by_file` | Desk (preprocessing, not exposed to any agent as a callable tool) | — | — | list of per-file diff chunks | Empty/malformed diff → returns an empty list with a reported reason; never raises |
-| `list_changed_files` | Security, Tests, Style | none | no | list of file paths touched in the diff | Returns empty list if the diff produced no chunks |
-| `get_file_diff` | Security, Tests, Style | `file_path: str` | no | that file's diff chunk text | Returns a not-found string if the path isn't among the split chunks |
 | `get_ruleset` | Style (**required** — see §9 below), Security, Tests (optional for these two) | none | **yes** — reads `context.ruleset_id` | ruleset text | Returns "ruleset unavailable" string if the file is missing/unreadable — never raises |
 | `merge_findings` (via Merge-as-tool) | Desk | the three reviewers' `list[Finding]` results | no | one deduplicated, severity-ordered `list[Finding]` | Returns the union unmodified (no dedup applied) with a note if the merge logic itself errors, rather than raising |
 
 `get_ruleset` satisfies FR-2's acceptance criterion: its generated schema has **zero parameters**,
 since `ruleset_id` comes from the run context, never from the model.
+
+**No per-file lookup tools.** Reviewers receive the reviewable diff text (the concatenated chunks
+from `split_diff_by_file`) directly as their run input, so there is no tool for listing changed
+files or fetching one file's diff — `get_ruleset` is the only tool any reviewer has. Per-file tools
+(`list_changed_files`, `get_file_diff`) were planned here originally and were never built, because
+nothing a reviewer does needs a second, narrower view of a diff it already holds in full.
 
 ## 4. Data Structures
 
@@ -211,11 +215,12 @@ demonstrable example of "the model has no choice but to call it."
 
 **Design decision — ceiling value: 6 turns per reviewer.**
 
-Rationale: a single reviewer's job is narrower than a full conversation — read the assigned diff
-chunk(s), optionally call `get_ruleset` and/or `get_file_diff`, and emit a `list[Finding]`. 2–4
-turns covers the realistic case; 6 gives headroom for a reviewer that checks a couple of additional
-files before concluding, while still bounding worst-case cost per reviewer. This is independent per
-reviewer — three reviewers running concurrently each get their own 6-turn budget, not a shared one.
+Rationale: a single reviewer's job is narrower than a full conversation — read the diff it was
+given as input, call `get_ruleset` (forced for Style, optional for Security and Tests), and emit a
+`list[Finding]`. That is 1 turn for a reviewer that skips the tool and 2 for one that calls it, so 2
+is the realistic case; 6 leaves headroom for a model that calls `get_ruleset` again after its forced
+first call, while still bounding worst-case cost per reviewer. This is independent per reviewer —
+three reviewers running concurrently each get their own 6-turn budget, not a shared one.
 
 ## 11. Persistence for the Ledger (NFR-3)
 
