@@ -14,6 +14,8 @@ runtime is needed.
 Run with `python test_fr12_streaming.py`.
 """
 
+import testing_env  # noqa: F401 — must stay the first import (no real trace export)
+
 import ast
 import asyncio
 import json

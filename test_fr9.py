@@ -9,6 +9,8 @@
 Only `Runner.run` is stubbed, and only in 9c. Run with `python test_fr9.py`.
 """
 
+import testing_env  # noqa: F401 — must stay the first import (no real trace export)
+
 import asyncio
 from pathlib import Path
 

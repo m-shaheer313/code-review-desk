@@ -7,6 +7,8 @@ Report is assembled.
 Run with `python test_desk_agent.py`.
 """
 
+import testing_env  # noqa: F401 — must stay the first import (no real trace export)
+
 import asyncio
 import json
 

@@ -6,6 +6,8 @@ both if the agent were mutated AND if the override were silently dropped.
 Run with `python test_model_override.py`.
 """
 
+import testing_env  # noqa: F401 — must stay the first import (no real trace export)
+
 import ast
 import asyncio
 import inspect

@@ -3,6 +3,8 @@
 Run with `pytest test_remediation_decision.py` or `python test_remediation_decision.py`.
 """
 
+import testing_env  # noqa: F401 — must stay the first import (no real trace export)
+
 from finding import Finding
 from remediation import decide_needs_remediation
 from reviewers import (
