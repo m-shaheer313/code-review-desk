@@ -45,6 +45,14 @@ REVIEWER_MAX_TURNS = 6
 
 API_KEY_VAR = "GEMINI_API_KEY"
 
+# See `Config.build_client`. Kept deliberately low: the SDK's backoff caps at a
+# few seconds, so aggressive retrying against a per-minute quota makes things
+# worse — 3 reviewers x 7 attempts is 21 requests hammering a window that never
+# gets a chance to clear (measured: 429s with 45-57s retry hints). A proper fix
+# would honor the RetryInfo delay Gemini returns in the error body, which the
+# OpenAI client does not read; until then, fewer attempts is strictly better.
+MAX_CLIENT_RETRIES = 3
+
 
 class ConfigError(RuntimeError):
     """Startup configuration is unusable. Carries a user-ready message."""
@@ -59,8 +67,21 @@ class Config:
 
     def build_client(self) -> AsyncOpenAI:
         """Return a fresh client. Per Article I.2, this is never installed as a
-        global default — callers hand it to the agent that needs it."""
-        return AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+        global default — callers hand it to the agent that needs it.
+
+        `max_retries` is raised above the SDK default of 2 because this project's
+        key is on the Gemini free tier: 5 requests/minute, while one review needs
+        about six (three reviewers, Style twice for its tool call, Merge, and
+        Remediation). Transient 503 "high demand" responses from this endpoint are
+        common on top of that. Rate limiting here is an expected operating
+        condition, not a defect, and the retries give the per-minute window time
+        to roll over instead of reporting a reviewer as failed.
+        """
+        return AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            max_retries=MAX_CLIENT_RETRIES,
+        )
 
 
 @lru_cache(maxsize=4)
