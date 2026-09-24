@@ -1,0 +1,33 @@
+# Ruleset: python-default
+# Style rules for Python code under review. Referenced by ReviewContext.ruleset_id.
+
+PY001  Naming: modules, functions, and variables use snake_case; classes use CapWords.
+       Constants are UPPER_SNAKE_CASE at module level.
+
+PY002  Line length: hard limit of 100 characters. Break long call chains at the
+       argument list rather than trailing off the right edge.
+
+PY003  Imports: standard library first, third party second, local modules last, each
+       group separated by a blank line. No wildcard imports (`from x import *`).
+
+PY004  Type hints: every public function and method annotates its parameters and its
+       return type. `Any` requires a comment justifying it.
+
+PY005  Exceptions: never use a bare `except:` or a bare `except Exception:` that
+       silently passes. Catch the narrowest exception that can actually occur, and
+       either handle it or re-raise with context.
+
+PY006  Mutable default arguments are forbidden (`def f(x=[])`). Use `None` and build
+       the default inside the body.
+
+PY007  Docstrings: every module and every public function has one. A docstring states
+       what the caller gets, not a restatement of the function name.
+
+PY008  Comparisons: use `is`/`is not` for `None`, and truthiness checks for emptiness
+       rather than `len(x) == 0`.
+
+PY009  f-strings are preferred over `%` formatting and `str.format`. No f-string
+       without a placeholder.
+
+PY010  Dead code: no commented-out blocks and no unreachable branches left behind.
+       Delete it; version control remembers.
