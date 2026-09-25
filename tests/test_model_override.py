@@ -3,7 +3,7 @@
 `Runner.run` is stubbed to capture the RunConfig it receives, so the test fails
 both if the agent were mutated AND if the override were silently dropped.
 
-Run with `python test_model_override.py`.
+Run with `pytest tests/test_model_override.py`, or standalone: `python tests/test_model_override.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

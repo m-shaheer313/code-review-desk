@@ -1,6 +1,6 @@
 """Tests for `decide_needs_remediation` (FR-6) — no model call, no network.
 
-Run with `pytest test_remediation_decision.py` or `python test_remediation_decision.py`.
+Run with `pytest tests/test_remediation_decision.py`, or standalone: `python tests/test_remediation_decision.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

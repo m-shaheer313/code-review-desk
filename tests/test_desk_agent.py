@@ -4,7 +4,7 @@ Only `Runner.run` is stubbed. The real Desk agent is built, so its tools, handof
 output type and guardrails are the real objects; the real guardrail runs; the real
 Report is assembled.
 
-Run with `python test_desk_agent.py`.
+Run with `pytest tests/test_desk_agent.py`, or standalone: `python tests/test_desk_agent.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

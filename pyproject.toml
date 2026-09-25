@@ -10,3 +10,15 @@ dependencies = [
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# Tests live in tests/; the product modules they import live at the project root.
+# `pythonpath` puts the root on sys.path for the test session (pytest's own
+# mechanism, pytest >= 7), so `from finding import Finding` resolves unchanged.
+testpaths = ["tests"]
+pythonpath = ["."]

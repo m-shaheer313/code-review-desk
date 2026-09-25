@@ -17,7 +17,7 @@ WHAT THESE PROVE, AND HOW
 What stays unproven until a live run: that the exported spans *render* as
 overlapping in the dashboard. That needs the real API.
 
-Run with `python test_fr13_tracing.py`.
+Run with `pytest tests/test_fr13_tracing.py`, or standalone: `python tests/test_fr13_tracing.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)
@@ -50,7 +50,8 @@ from reviewers import (
 )
 from test_desk_agent import DIFF, FakeResult, MERGED, SECURITY_RAW, STYLE_RAW, TESTS_RAW
 
-ROOT = Path(__file__).resolve().parent
+# This file lives in tests/; the product files it inspects live one level up.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REVIEWERS = [SECURITY_REVIEWER_NAME, TESTS_REVIEWER_NAME, STYLE_REVIEWER_NAME]
 RAW = {
     SECURITY_REVIEWER_NAME: SECURITY_RAW,
@@ -317,9 +318,11 @@ def test_tracing_is_on_by_default() -> None:
 def test_no_live_code_path_hardcodes_tracing_off() -> None:
     # Article VII.1: no product module or live script may switch tracing off.
     offenders = []
-    for path in list(ROOT.glob("*.py")) + list((ROOT / "scripts").glob("*.py")):
-        if path.name.startswith("test_"):
-            continue
+    scanned = list(PROJECT_ROOT.glob("*.py")) + list((PROJECT_ROOT / "scripts").glob("*.py"))
+    # Guard against a vacuous pass: if the scan points at the wrong directory it
+    # finds nothing and "no offenders" would be meaningless.
+    assert {"main.py", "desk.py", "review_runner.py"} <= {p.name for p in scanned}, scanned
+    for path in scanned:
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.keyword) and node.arg == "tracing_disabled":
                 if isinstance(node.value, ast.Constant) and node.value.value is True:
@@ -389,12 +392,12 @@ def test_configure_tracing_rejects_missing_gemini_and_non_openai_keys() -> None:
 
 
 def test_both_entry_points_configure_tracing_before_reviewing() -> None:
-    main_tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+    main_tree = ast.parse((PROJECT_ROOT / "main.py").read_text(encoding="utf-8"))
     main_fn = next(n for n in main_tree.body if getattr(n, "name", None) == "main")
     main_calls = [ast.unparse(n.func) for n in ast.walk(main_fn) if isinstance(n, ast.Call)]
     assert "configure_tracing" in main_calls
 
-    chat_tree = ast.parse((ROOT / "chat_session.py").read_text(encoding="utf-8"))
+    chat_tree = ast.parse((PROJECT_ROOT / "chat_session.py").read_text(encoding="utf-8"))
     handler = next(n for n in chat_tree.body if getattr(n, "name", None) == "handle_message")
     ordered = [ast.unparse(n.func) for n in ast.walk(handler) if isinstance(n, ast.Call)]
     assert "configure_tracing" in ordered

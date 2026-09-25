@@ -11,7 +11,7 @@ app.py calls — with plain stand-ins for `cl.user_session` and `cl.Message.send
 app.py itself is checked by parsing its source, not importing it, so no Chainlit
 runtime is needed.
 
-Run with `python test_fr12_streaming.py`.
+Run with `pytest tests/test_fr12_streaming.py`, or standalone: `python tests/test_fr12_streaming.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)
@@ -45,7 +45,8 @@ from test_desk_agent import (
 )
 from test_fr9 import ceiling
 
-ROOT = Path(__file__).resolve().parent
+# This file lives in tests/; the product files it inspects live one level up.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LIST_ORDER = [SECURITY_REVIEWER_NAME, TESTS_REVIEWER_NAME, STYLE_REVIEWER_NAME]
 # Deliberately NOT list order: Tests first, Style second, Security last.
 DELAYS = {SECURITY_REVIEWER_NAME: 0.30, TESTS_REVIEWER_NAME: 0.05, STYLE_REVIEWER_NAME: 0.15}
@@ -193,7 +194,7 @@ def test_fr5_group_time_tracks_the_slowest_not_the_sum() -> None:
 def test_still_exactly_one_gather_and_no_as_completed() -> None:
     # Article V.1: launched together, awaited as a group. Streaming must not have
     # replaced the gather.
-    tree = ast.parse((ROOT / "review_runner.py").read_text(encoding="utf-8"))
+    tree = ast.parse((PROJECT_ROOT / "review_runner.py").read_text(encoding="utf-8"))
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     gathers = [c for c in calls if getattr(c.func, "attr", None) == "gather"]
     assert len(gathers) == 1
@@ -367,20 +368,20 @@ def _module_level_mutables(path: Path) -> list[str]:
 
 
 def test_no_module_level_session_container_in_app_or_session_logic() -> None:
-    assert _module_level_mutables(ROOT / "app.py") == []
+    assert _module_level_mutables(PROJECT_ROOT / "app.py") == []
     # chat_session.py's only module-level dict is HEADER_KEYS, a read-only
     # key-spelling table that never holds session data.
-    leftovers = [m for m in _module_level_mutables(ROOT / "chat_session.py")
+    leftovers = [m for m in _module_level_mutables(PROJECT_ROOT / "chat_session.py")
                  if not m.startswith("HEADER_KEYS")]
     assert leftovers == [], leftovers
 
 
 def test_handler_awaits_the_run_and_never_calls_a_sync_variant() -> None:
     for name in ("app.py", "chat_session.py"):
-        source = (ROOT / name).read_text(encoding="utf-8")
+        source = (PROJECT_ROOT / name).read_text(encoding="utf-8")
         for forbidden in ("asyncio.run(", "run_sync(", "run_until_complete(", "make_async("):
             assert forbidden not in source, (name, forbidden)
-    tree = ast.parse((ROOT / "chat_session.py").read_text(encoding="utf-8"))
+    tree = ast.parse((PROJECT_ROOT / "chat_session.py").read_text(encoding="utf-8"))
     handler = next(n for n in tree.body if getattr(n, "name", None) == "handle_message")
     assert isinstance(handler, ast.AsyncFunctionDef)
     awaited = [ast.unparse(n.value) for n in ast.walk(handler) if isinstance(n, ast.Await)]
@@ -402,10 +403,10 @@ def _register_calls(path: Path) -> list[str]:
 
 
 def test_both_entry_points_make_the_identical_registration_call() -> None:
-    assert _register_calls(ROOT / "main.py") == ["register_ledger()"]
-    assert _register_calls(ROOT / "app.py") == ["register_ledger()"]
+    assert _register_calls(PROJECT_ROOT / "main.py") == ["register_ledger()"]
+    assert _register_calls(PROJECT_ROOT / "app.py") == ["register_ledger()"]
     # In app.py it runs from on_app_startup: once per process, not per session.
-    tree = ast.parse((ROOT / "app.py").read_text(encoding="utf-8"))
+    tree = ast.parse((PROJECT_ROOT / "app.py").read_text(encoding="utf-8"))
     startup = next(n for n in tree.body if getattr(n, "name", None) == "on_app_startup")
     assert "cl.on_app_startup" in [ast.unparse(d) for d in startup.decorator_list]
     assert any(

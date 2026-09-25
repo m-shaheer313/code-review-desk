@@ -11,7 +11,7 @@ is touched.
 Because the scripted usage is known exactly, the footer assertions check exact
 token totals: a placeholder 0, an estimate, or a mixed-up reviewer would all fail.
 
-Run with `python test_fr10_hooks.py`.
+Run with `pytest tests/test_fr10_hooks.py`, or standalone: `python tests/test_fr10_hooks.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

@@ -5,7 +5,7 @@ process, and a full stubbed review is run. A capturing processor replaces the
 exporter purely as a measuring device (so even a broken guard could not send
 anything); it receives a trace only if tracing is enabled. It must receive none.
 
-Run with `python test_trace_guard.py`.
+Run with `pytest tests/test_trace_guard.py`, or standalone: `python tests/test_trace_guard.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)
@@ -24,7 +24,10 @@ from review_context import ReviewContext
 from test_desk_agent import DIFF, FakeResult
 from test_fr9 import install_stub
 
-ROOT = Path(__file__).resolve().parent
+# This file lives in tests/. Test files are its siblings; product code and
+# scripts/ live one level up.
+TESTS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = TESTS_DIR.parent
 
 
 class CountingProcessor(TracingProcessor):
@@ -60,7 +63,7 @@ def test_every_test_file_imports_the_guard_first() -> None:
     # A new test file that forgets the guard fails here, instead of exporting.
     # conftest.py is included: under pytest it is what loads the guard before any
     # test module, whatever order pytest collects them in.
-    test_files = sorted(ROOT.glob("test_*.py")) + [ROOT / "conftest.py"]
+    test_files = sorted(TESTS_DIR.glob("test_*.py")) + [TESTS_DIR / "conftest.py"]
     assert len(test_files) >= 11
     offenders = {
         p.name: _first_import(p)
@@ -105,10 +108,13 @@ def test_no_trace_is_created_even_with_an_openai_key_present() -> None:
 
 def test_product_code_and_live_scripts_never_import_the_guard() -> None:
     # Live reviews must trace (Article VII.1); only tests may switch it off.
-    test_infrastructure = {"testing_env.py", "conftest.py"}
-    for path in list(ROOT.glob("*.py")) + list((ROOT / "scripts").glob("*.py")):
-        if path.name.startswith("test_") or path.name in test_infrastructure:
-            continue
+    # Test code lives in tests/, so this scan of the project root and scripts/
+    # covers exactly the product code and the live scripts.
+    scanned = list(PROJECT_ROOT.glob("*.py")) + list((PROJECT_ROOT / "scripts").glob("*.py"))
+    # Guard against a vacuous pass from scanning the wrong directory.
+    assert {"main.py", "app.py", "desk.py"} <= {p.name for p in scanned}, scanned
+    assert not any(p.name.startswith("test_") or p.name == "testing_env.py" for p in scanned)
+    for path in scanned:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

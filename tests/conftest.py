@@ -1,6 +1,6 @@
 """pytest configuration: import-order guarantee and per-test isolation.
 
-WHY THIS FILE EXISTS. Run as `python test_x.py`, every test file got its own
+WHY THIS FILE EXISTS. Run as `python tests/test_x.py`, every test file got its own
 process. Under `pytest` they all share ONE process, and pytest imports every test
 module during collection, before running any test. Two kinds of process-wide
 state then leak between files; both were observed, not hypothesized (9 failures
@@ -19,7 +19,7 @@ WHAT IT DOES.
   test module, so OPENAI_AGENTS_DISABLE_TRACING is set before any code can create
   a trace — regardless of the order pytest collects files in. The per-file
   `import testing_env` lines stay: they give the same guarantee when a file is
-  run on its own with `python test_x.py`.
+  run on its own with `python tests/test_x.py`.
 - Resets, before and after every test: the real `Runner.run`, tracing switched
   off, and the ledger's run-observer list emptied. A test that needs something
   else (test_fr13_tracing) sets it up in its own fixture, which runs after this.

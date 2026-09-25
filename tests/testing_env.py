@@ -32,7 +32,18 @@ trace.
 """
 
 import os
+import sys
+from pathlib import Path
 
 TRACING_DISABLE_VAR = "OPENAI_AGENTS_DISABLE_TRACING"
 
 os.environ[TRACING_DISABLE_VAR] = "1"
+
+# Tests live in tests/, the product modules at the project root. Under pytest,
+# pyproject.toml's `pythonpath = ["."]` puts the root on sys.path. A standalone
+# `python tests/test_x.py` run gets only tests/ on sys.path, so the root is added
+# here — this module is the first import of every test file, so it happens before
+# any product import.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))

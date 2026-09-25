@@ -6,7 +6,7 @@
 9c — REVIEWER_MAX_TURNS reaches every reviewer run, and a ceiling hit becomes a
      partial review in the assembled Report rather than a crash.
 
-Only `Runner.run` is stubbed, and only in 9c. Run with `python test_fr9.py`.
+Only `Runner.run` is stubbed, and only in 9c. Run with `pytest tests/test_fr9.py`, or standalone: `python tests/test_fr9.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

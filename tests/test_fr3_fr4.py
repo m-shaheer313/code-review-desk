@@ -20,7 +20,7 @@ FR-4 — two contexts that differ in language and strictness resolve to visibly
 different prompts, strict is terser, and the resolved prompt can be inspected
 before any model call — through the same callable the SDK invokes per run.
 
-Run with `python test_fr3_fr4.py`.
+Run with `pytest tests/test_fr3_fr4.py`, or standalone: `python tests/test_fr3_fr4.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

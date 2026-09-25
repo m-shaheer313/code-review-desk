@@ -1,6 +1,6 @@
 """Tests for FR-8's credential guardrail. No model call, no network.
 
-Run with `python test_guardrail.py`.
+Run with `pytest tests/test_guardrail.py`, or standalone: `python tests/test_guardrail.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)

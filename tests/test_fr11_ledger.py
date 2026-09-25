@@ -9,7 +9,7 @@ project-root `ledger.jsonl` is untouched by the whole exercise.
 Model calls are stubbed at `Runner.run`, reusing test_fr9's stub (which supports
 per-reviewer failures) and test_desk_agent's fixtures.
 
-Run with `python test_fr11_ledger.py`.
+Run with `pytest tests/test_fr11_ledger.py`, or standalone: `python tests/test_fr11_ledger.py`.
 """
 
 import testing_env  # noqa: F401 — must stay the first import (no real trace export)
@@ -193,7 +193,7 @@ def test_unregistering_switches_the_ledger_off() -> None:
 
 def test_no_agent_or_reviewer_module_imports_the_ledger() -> None:
     # "No agent definition mentions it" (spec.md §4.11), checked on the imports.
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent  # project root; this file is in tests/
     for module in (
         "reviewers.py", "review_runner.py", "desk.py", "merge.py",
         "remediation.py", "tools.py", "hooks.py", "guardrail.py",
