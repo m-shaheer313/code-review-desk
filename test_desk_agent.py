@@ -298,7 +298,7 @@ def test_run_review_does_not_swallow_the_sdk_tripwire() -> None:
     raise AssertionError("the tripwire must reach the entry point, not be caught in desk")
 
 
-def test_entry_point_catches_both_refusal_types_and_shows_no_findings(capsys=None) -> None:
+def test_entry_point_catches_both_refusal_types_and_shows_no_findings() -> None:
     import io
     import contextlib
 

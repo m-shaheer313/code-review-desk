@@ -30,6 +30,7 @@ import re
 import tempfile
 from pathlib import Path
 
+import pytest
 from agents import get_current_trace, set_trace_processors, set_tracing_disabled
 from agents.tool_context import ToolContext
 from agents.tracing.processor_interface import TracingProcessor
@@ -86,13 +87,31 @@ class CapturingProcessor(TracingProcessor):
 
 
 PROCESSOR = CapturingProcessor()
-# ORDER MATTERS. testing_env switched tracing off for every test file; this one
-# needs it on. First remove the real exporter by replacing all processors with
-# the capturing one, THEN re-enable tracing (the SDK lets set_tracing_disabled
-# override the env flag). There is never a moment with tracing on and the real
-# exporter still installed.
-set_trace_processors([PROCESSOR])
-set_tracing_disabled(False)
+
+
+def enable_capturing_tracing() -> None:
+    """Turn tracing ON for this file's tests, with nothing exported.
+
+    ORDER MATTERS. testing_env switched tracing off; this file needs it on. First
+    remove the real exporter by replacing all processors with the capturing one,
+    THEN re-enable tracing (the SDK lets set_tracing_disabled override the env
+    flag). There is never a moment with tracing on and the real exporter still
+    installed.
+
+    Deliberately NOT done at import time: under pytest every test module is
+    imported before any test runs, so an import-time override would switch
+    tracing on for the whole session (observed: it broke test_trace_guard).
+    """
+    set_trace_processors([PROCESSOR])
+    set_tracing_disabled(False)
+
+
+@pytest.fixture(autouse=True)
+def tracing_on_for_this_file():
+    # Runs after conftest.py's reset (which turns tracing off), and re-installs
+    # the capturing processor in case another file replaced it.
+    enable_capturing_tracing()
+    yield
 
 runs: list[dict] = []
 
@@ -389,6 +408,8 @@ def test_trace_id_mapping_matches_the_sdk_shape() -> None:
 
 
 if __name__ == "__main__":
+    # Standalone run: no pytest fixtures, so set tracing up once, here.
+    enable_capturing_tracing()
     passed = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

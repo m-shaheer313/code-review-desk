@@ -58,8 +58,10 @@ def _first_import(path: Path) -> str:
 
 def test_every_test_file_imports_the_guard_first() -> None:
     # A new test file that forgets the guard fails here, instead of exporting.
-    test_files = sorted(ROOT.glob("test_*.py"))
-    assert len(test_files) >= 10
+    # conftest.py is included: under pytest it is what loads the guard before any
+    # test module, whatever order pytest collects them in.
+    test_files = sorted(ROOT.glob("test_*.py")) + [ROOT / "conftest.py"]
+    assert len(test_files) >= 11
     offenders = {
         p.name: _first_import(p)
         for p in test_files
@@ -103,8 +105,9 @@ def test_no_trace_is_created_even_with_an_openai_key_present() -> None:
 
 def test_product_code_and_live_scripts_never_import_the_guard() -> None:
     # Live reviews must trace (Article VII.1); only tests may switch it off.
+    test_infrastructure = {"testing_env.py", "conftest.py"}
     for path in list(ROOT.glob("*.py")) + list((ROOT / "scripts").glob("*.py")):
-        if path.name.startswith("test_") or path.name == "testing_env.py":
+        if path.name.startswith("test_") or path.name in test_infrastructure:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):

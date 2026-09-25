@@ -4,3 +4,4 @@ __pycache__/
 ledger.jsonl
 .files/
 .chainlit/translations/
+.pytest_cache/
