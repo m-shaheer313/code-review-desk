@@ -1,7 +1,7 @@
 """The Desk's own output structure (plan.md §4.3, FR-6/FR-10).
 
 `footer` rows carry per-reviewer latency and token counts, both measured, never
-estimated (Article VII.3): latency from FR-5's monotonic bracket around each run,
+estimated (Article VII.3): latency from FR-5's perf_counter bracket around each run,
 tokens from FR-10's run-level hooks reading each run's own Usage.
 
 `tokens` is `int | None`. `None` means the hooks never saw that run's context, so
