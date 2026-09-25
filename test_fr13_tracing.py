@@ -38,7 +38,6 @@ import config
 import desk
 import ledger
 import review_runner
-from finding import Finding
 from merge import MERGE_SPECIALIST_NAME, MERGE_TOOL_NAME
 from remediation import REMEDIATION_SPECIALIST_NAME
 from review_context import ReviewContext
@@ -297,11 +296,10 @@ def test_tracing_is_on_by_default() -> None:
 
 
 def test_no_live_code_path_hardcodes_tracing_off() -> None:
-    # Article VII.1. try_style_reviewer.py is the temporary FR-3 harness marked
-    # TODO(remove-before-phase-3); it is excluded by name, not silently.
+    # Article VII.1: no product module or live script may switch tracing off.
     offenders = []
     for path in list(ROOT.glob("*.py")) + list((ROOT / "scripts").glob("*.py")):
-        if path.name.startswith("test_") or path.name == "try_style_reviewer.py":
+        if path.name.startswith("test_"):
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.keyword) and node.arg == "tracing_disabled":

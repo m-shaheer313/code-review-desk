@@ -59,7 +59,7 @@ from review_runner import (
     run_all_reviewers,
     trace_id_for,
 )
-from reviewers import SECURITY_REVIEWER_NAME, shared_model
+from reviewers import shared_model
 
 DESK_NAME = "Desk"
 
@@ -160,15 +160,6 @@ def build_footer(group: GroupOutcome) -> list[ReviewerFooterRow]:
             partial=outcome.failed,
         )
         for outcome in group.outcomes
-    ]
-
-
-def critical_security_findings(findings: list[Finding]) -> list[Finding]:
-    """The findings that justify remediation — used for the deterministic flag."""
-    return [
-        f
-        for f in findings
-        if f.severity == "critical" and f.source_reviewer == SECURITY_REVIEWER_NAME
     ]
 
 
