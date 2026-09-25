@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 from agents import Agent, RunConfig, Runner
 from agents.exceptions import MaxTurnsExceeded
+from agents.items import ToolCallOutputItem
 
 from config import REVIEWER_MAX_TURNS, build_model
 from finding import Finding
@@ -34,11 +35,14 @@ from hooks import AgentEvent, ReviewerRunHooks
 from review_context import ReviewContext
 from reviewers import (
     SECURITY_REVIEWER_NAME,
+    STYLE_RULESET_LOOKUP_INPUT,
     STYLE_REVIEWER_NAME,
     TESTS_REVIEWER_NAME,
     build_security_reviewer,
     build_style_reviewer,
+    build_style_ruleset_lookup,
     build_tests_reviewer,
+    style_review_input,
 )
 
 # Single source of truth for these names is `reviewers.py`, where the agents are
@@ -55,8 +59,11 @@ class ReviewerOutcome:
 
     reviewer: str
     findings: list[Finding] = field(default_factory=list)
-    # Authoritative latency: the manual monotonic bracket around Runner.run, the
-    # same span the group's gather is measured over (FR-5). See _timed_run.
+    # Authoritative latency: the manual perf_counter bracket around the reviewer's
+    # run(s), the same span the group's gather is measured over (FR-5). See
+    # _timed_run. perf_counter, not monotonic: on Windows time.monotonic() is
+    # GetTickCount64 with 15.625 ms resolution, so a fast reviewer could be
+    # reported as taking 0 ms (measured 2026-09-25).
     elapsed_ms: int = 0
     failed: bool = False
     # Short, user-safe description of the failure — the exception type and its
@@ -142,13 +149,10 @@ async def run_reviewer_with_override(
     # `replace` keeps any trace grouping the caller set up and swaps only the model.
     run_config = replace(run_config, model=override_model)
 
-    return await Runner.run(
-        agent,
-        diff_text,
-        context=context,
-        max_turns=REVIEWER_MAX_TURNS,  # a cheaper model is not a looser ceiling
-        run_config=run_config,
-    )
+    # Through the same path as a normal review, so a second opinion on Style also
+    # makes the forced ruleset lookup first (FR-9a). The turn ceiling is applied
+    # there, per run: a cheaper model is not a looser ceiling.
+    return await run_reviewer(agent, diff_text, context, run_config)
 
 
 async def _timed_run(
@@ -175,19 +179,81 @@ async def _timed_run(
     the group's gather, breaking FR-5's group-vs-sum comparison. The hooks own
     token usage; this timer owns latency.
     """
-    start = time.monotonic()
+    start = time.perf_counter()
     try:
-        return await Runner.run(
-            agent,
-            diff_text,
+        return await run_reviewer(agent, diff_text, context, run_config, hooks)
+    finally:
+        elapsed[reviewer] = time.perf_counter() - start
+        finished_at[reviewer] = datetime.now(timezone.utc)
+
+
+class RulesetNotConsulted(Exception):
+    """The Style Reviewer's lookup step ended without a get_ruleset result.
+
+    Raised rather than reviewing without rules: FR-9a says Style findings must
+    not be produced without consulting the ruleset. It fails only the Style
+    reviewer — the gather's return_exceptions=True keeps the other two running.
+    """
+
+
+def _ruleset_from_lookup(result) -> str:
+    """The text get_ruleset returned in the lookup step (FR-9a).
+
+    Read from the run's tool-output items, not from `final_output`: that proves a
+    tool actually executed. The lookup agent has exactly one tool, so any tool
+    output in its run is get_ruleset's. When the ruleset is missing, the tool
+    itself returns a "ruleset unavailable" sentence — that is still a consulted
+    ruleset, and it is passed on for the Style prompt's fallback to act on.
+    """
+    outputs = [
+        item.output
+        for item in getattr(result, "new_items", None) or []
+        if isinstance(item, ToolCallOutputItem)
+    ]
+    if not outputs:
+        raise RulesetNotConsulted(
+            "the ruleset lookup step ended without calling get_ruleset"
+        )
+    return str(outputs[-1])
+
+
+async def run_reviewer(
+    agent: Agent[ReviewContext],
+    diff_text: str,
+    context: ReviewContext,
+    run_config: RunConfig,
+    hooks: ReviewerRunHooks | None = None,
+):
+    """Run one reviewer to its findings. The one place that knows HOW each
+    reviewer runs, used by both the concurrent group and FR-7's override.
+
+    Security and Tests: one run over the diff.
+
+    Style: two runs, in order (FR-9a, plan.md §9). First the lookup agent, whose
+    tool_choice forces get_ruleset; then the Style Reviewer, given that exact
+    ruleset text plus the diff. Two runs because Gemini rejects a forced tool call
+    combined with JSON output in one request. Both runs share this reviewer's
+    RunConfig (so one trace group), its run-level hooks (so its footer tokens are
+    the sum of both), and each gets the full per-run turn ceiling (plan.md §10).
+    """
+    if agent.name == STYLE_REVIEWER_NAME:
+        lookup = await Runner.run(
+            build_style_ruleset_lookup(),
+            STYLE_RULESET_LOOKUP_INPUT,
             context=context,
-            max_turns=REVIEWER_MAX_TURNS,  # plan.md §10, per reviewer, not shared
+            max_turns=REVIEWER_MAX_TURNS,
             run_config=run_config,
             hooks=hooks,
         )
-    finally:
-        elapsed[reviewer] = time.monotonic() - start
-        finished_at[reviewer] = datetime.now(timezone.utc)
+        diff_text = style_review_input(_ruleset_from_lookup(lookup), diff_text)
+    return await Runner.run(
+        agent,
+        diff_text,
+        context=context,
+        max_turns=REVIEWER_MAX_TURNS,  # plan.md §10, per reviewer run, not shared
+        run_config=run_config,
+        hooks=hooks,
+    )
 
 
 def _describe_failure(exc: BaseException) -> str:
@@ -444,14 +510,14 @@ async def run_all_reviewers(
         await _announce(on_reviewer_done, built[name])
         return result
 
-    group_start = time.monotonic()
+    group_start = time.perf_counter()
     await asyncio.gather(
         *(run_and_announce(name, agent) for name, agent in agents_by_name),
         # Required by plan.md §5: one reviewer's exception must not cancel the
         # other two in-flight reviewers.
         return_exceptions=True,
     )
-    group_elapsed = time.monotonic() - group_start
+    group_elapsed = time.perf_counter() - group_start
 
     # Reported in the fixed Security, Tests, Style order regardless of which
     # finished first — the streaming callback is where completion order lives.

@@ -117,16 +117,20 @@ def build_style_instructions(context: ReviewContext | None) -> str:
     """
     language, strictness, ruleset_id = _context_fields(context)
 
+    # The ruleset itself arrives in the INPUT, under the RULESET heading, exactly
+    # as the get_ruleset tool returned it in the forced lookup step (FR-9a,
+    # plan.md §9). The prompt only says where to find it and how to treat it.
     if ruleset_exists(ruleset_id):
         ruleset_line = (
-            f"The ruleset for this review is '{ruleset_id}'. Call the get_ruleset "
-            f"tool to read it before reporting anything — it is the only authority "
-            f"on what counts as a violation here."
+            f"The ruleset for this review is '{ruleset_id}'. Its full text is at the "
+            f"top of your input under RULESET, exactly as the get_ruleset tool "
+            f"returned it. It is the only authority on what counts as a violation "
+            f"here — cite its rule ids in your findings."
         )
     else:
         ruleset_line = (
-            "No ruleset could be resolved for this review. Call the get_ruleset "
-            "tool anyway to confirm, then fall back to widely accepted "
+            "No ruleset could be resolved for this review; the RULESET section of "
+            "your input says so. Fall back to widely accepted "
             f"{language} style conventions and say so in your findings. Do not "
             "invent rules or attribute them to a ruleset."
         )
@@ -301,33 +305,74 @@ def build_base_reviewer() -> Agent[ReviewContext]:
     )
 
 
-def build_style_reviewer() -> Agent[ReviewContext]:
-    """Style Reviewer: a clone of Base with per-run instructions and the ruleset
-    tool, whose call is FORCED (FR-9a, plan.md §9).
+STYLE_RULESET_LOOKUP_NAME = "StyleRulesetLookup"
 
-    `tool_choice` names `get_ruleset` specifically. "required" would only force
-    *some* tool call — with more tools later, the model could satisfy it without
-    ever reading the ruleset. The name is taken from the tool object rather than
-    typed as a literal, so renaming the tool cannot silently unpin it.
+STYLE_RULESET_LOOKUP_INSTRUCTIONS = (
+    "You are the ruleset lookup step of a code style review. Call the "
+    "get_ruleset tool. Do nothing else."
+)
+# The lookup step's input. It needs no diff — its only job is the forced call.
+STYLE_RULESET_LOOKUP_INPUT = "Fetch the ruleset for this review."
 
-    `reset_tool_choice=True` is load-bearing, not decoration: it drops the forced
-    choice back to "auto" after the first tool call. Without it, the model would
-    be forced to call `get_ruleset` on every turn, could never emit its findings,
-    and every Style run would end in MaxTurnsExceeded. It is the SDK default; it is
-    set explicitly so nobody "simplifies" it away.
+
+def build_style_ruleset_lookup() -> Agent[ReviewContext]:
+    """Phase 1 of the Style Reviewer: the FORCED `get_ruleset` call (FR-9a).
+
+    WHY A SEPARATE STEP. Gemini's OpenAI-compatible endpoint rejects a request
+    that both forces a tool call and requires JSON output — verified live
+    2026-09-25: HTTP 400 "Forced function calling (ANY mode) with a response mime
+    type: 'application/json' is unsupported", for a named tool_choice AND for
+    "required" alike. The SDK sends an agent's JSON output format on every request
+    it makes, so no single agent can have both a forced tool_choice and a
+    structured output_type. The force therefore lives here, on an agent with NO
+    output_type; the structured findings come from `build_style_reviewer`.
+
+    - `tool_choice` names `get_ruleset` specifically, taken from the tool object
+      so a rename cannot silently unpin it. The model has no choice.
+    - `tool_use_behavior="stop_on_first_tool"`: the run ends the moment the tool
+      has executed, so this is exactly one model request, and the run's output is
+      the tool's own return value — never the model's paraphrase of it.
+    - Exactly one tool, so any tool output in this run is get_ruleset's.
     """
     return build_base_reviewer().clone(
-        name=STYLE_REVIEWER_NAME,
-        instructions=_style_instructions_for_run,
+        name=STYLE_RULESET_LOOKUP_NAME,
+        instructions=STYLE_RULESET_LOOKUP_INSTRUCTIONS,
         tools=[get_ruleset],
-        output_type=list[Finding],
+        output_type=None,
+        tool_use_behavior="stop_on_first_tool",
         model_settings=ModelSettings(
             temperature=STYLE_TEMPERATURE,
             max_tokens=STYLE_MAX_TOKENS,
             tool_choice=get_ruleset.name,
         ),
-        reset_tool_choice=True,
     )
+
+
+def build_style_reviewer() -> Agent[ReviewContext]:
+    """Phase 2 of the Style Reviewer: findings, from the ruleset phase 1 fetched.
+
+    Receives the ruleset text in its input (see `style_review_input`) and emits
+    `list[Finding]`. It has NO tools and NO forced tool_choice — deliberately:
+    combining a forced tool_choice with this structured output_type is exactly the
+    request Gemini rejects (see `build_style_ruleset_lookup`). FR-9a's "no choice
+    but to call get_ruleset" is met by phase 1, which always runs first.
+    """
+    return build_base_reviewer().clone(
+        name=STYLE_REVIEWER_NAME,
+        instructions=_style_instructions_for_run,
+        tools=[],
+        output_type=list[Finding],
+        model_settings=ModelSettings(
+            temperature=STYLE_TEMPERATURE,
+            max_tokens=STYLE_MAX_TOKENS,
+        ),
+    )
+
+
+def style_review_input(ruleset_text: str, diff_text: str) -> str:
+    """Phase 2's input: the ruleset exactly as get_ruleset returned it, then the
+    diff. The RULESET heading is what the Style prompt tells the model to read."""
+    return f"RULESET\n{ruleset_text}\n\nDIFF\n{diff_text}"
 
 
 def build_security_reviewer() -> Agent[ReviewContext]:

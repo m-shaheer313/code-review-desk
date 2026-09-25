@@ -16,7 +16,8 @@ import review_runner
 from config import CHEAP_MODEL_NAME, MODEL_NAME
 from review_context import ReviewContext
 from review_runner import run_reviewer_with_override
-from reviewers import build_style_reviewer
+from reviewers import STYLE_RULESET_LOOKUP_NAME, build_style_reviewer
+from test_desk_agent import lookup_result
 
 DIFF = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a = 1\n+a = 2"
 
@@ -41,6 +42,8 @@ def install_stub():
                 "max_turns": kwargs.get("max_turns"),
             }
         )
+        if resolved.name == STYLE_RULESET_LOOKUP_NAME:
+            return lookup_result(resolved)  # Style's forced get_ruleset step (FR-9a)
         return FakeResult([])
 
     review_runner.Runner.run = fake_run
@@ -62,8 +65,10 @@ def test_agent_model_object_is_not_touched_by_the_override() -> None:
     # Identity, not equality: the same object, not merely an equal one.
     assert agent.model is model_before
     # And the agent the run actually received still carried its own model.
-    assert captured[0]["agent"] is agent
-    assert captured[0]["agent_model"] is model_before
+    # (Style makes two runs — its forced ruleset lookup first, FR-9a — so find
+    # the run of THIS agent rather than assuming it is the first.)
+    style_run = next(c for c in captured if c["agent"] is agent)
+    assert style_run["agent_model"] is model_before
     assert agent.model.model == MODEL_NAME
 
 
@@ -85,6 +90,9 @@ def test_run_config_carries_the_override_model() -> None:
     # The override is a different object from the agent's own model.
     assert run_config.model is not agent.model
     assert agent.model.model != run_config.model.model
+    # Every run of the second opinion carries it — the lookup AND the review.
+    assert len(captured) == 2
+    assert all(c["run_config"].model.model == CHEAP_MODEL_NAME for c in captured)
 
 
 def test_same_agent_runs_under_its_own_model_then_the_override() -> None:
@@ -106,9 +114,13 @@ def test_same_agent_runs_under_its_own_model_then_the_override() -> None:
 
     asyncio.run(both())
 
-    assert len(captured) == 2
+    # 1 direct run of the agent, then the override path: Style's lookup + Style.
+    assert [c["agent"].name for c in captured] == [
+        agent.name, STYLE_RULESET_LOOKUP_NAME, agent.name,
+    ]
     assert captured[0]["run_config"].model is None  # ran under the agent's own model
-    assert captured[1]["run_config"].model.model == CHEAP_MODEL_NAME
+    # The override reaches BOTH runs of the second opinion, lookup included.
+    assert all(c["run_config"].model.model == CHEAP_MODEL_NAME for c in captured[1:])
     assert agent.model is model_before
 
 

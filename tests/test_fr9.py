@@ -34,7 +34,8 @@ from reviewers import (
     build_style_reviewer,
     build_tests_reviewer,
 )
-from test_desk_agent import DIFF, FakeResult, SECURITY_RAW, STYLE_RAW, TESTS_RAW
+from reviewers import STYLE_RULESET_LOOKUP_NAME, build_style_ruleset_lookup
+from test_desk_agent import DIFF, FakeResult, SECURITY_RAW, STYLE_RAW, TESTS_RAW, lookup_result
 
 
 def context(ruleset_id: str = "python-default") -> ReviewContext:
@@ -45,38 +46,120 @@ def context(ruleset_id: str = "python-default") -> ReviewContext:
 
 # ---------------------------------------------------------------------------
 # 9a — required tool call
+#
+# MECHANISM (plan.md §9): two steps. Gemini's endpoint rejects a forced tool call
+# combined with JSON output in one request (HTTP 400, verified live 2026-09-25 for
+# a named tool_choice AND for "required"). So the force lives on a lookup agent
+# with no structured output, which always runs first; the Style Reviewer then
+# produces list[Finding] from the ruleset text the lookup's tool call returned.
 # ---------------------------------------------------------------------------
 
 
-def test_9a_style_forces_get_ruleset_by_name() -> None:
-    style = build_style_reviewer()
-    choice = style.model_settings.tool_choice
-    # Pinned to the one tool — not "required" (any tool would satisfy it) and
-    # not "auto" (optional).
-    assert choice == "get_ruleset", choice
-    assert choice not in ("required", "auto", "none")
-    # And it names a tool the agent actually has.
-    assert choice in [t.name for t in style.tools]
+
+def _is_forced(tool_choice) -> bool:
+    return tool_choice is not None and tool_choice not in ("auto", "none")
+
+
+def _every_agent_in_the_system():
+    """Every agent definition a review can run, including the nested ones."""
+    import merge
+    import remediation
+
+    return [
+        build_security_reviewer(),
+        build_tests_reviewer(),
+        build_style_ruleset_lookup(),
+        build_style_reviewer(),
+        merge.build_merge_specialist(),
+        remediation.build_remediation_specialist(),
+        desk.build_desk(),
+    ]
+
+
+def test_9a_no_agent_combines_a_forced_tool_choice_with_structured_output() -> None:
+    """The regression test for the live 400. This combination is exactly what
+    Gemini's endpoint refuses, so NO agent may carry both — whatever its name."""
+    offenders = [
+        agent.name
+        for agent in _every_agent_in_the_system()
+        if _is_forced(agent.model_settings.tool_choice)
+        and agent.output_type not in (None, str)
+    ]
+    assert offenders == [], f"forced tool_choice + structured output: {offenders}"
+
+
+def test_9a_lookup_forces_get_ruleset_by_name_with_no_structured_output() -> None:
+    lookup = build_style_ruleset_lookup()
+    # Pinned to the one tool — not "auto" (optional). (Named rather than
+    # "required" only for clarity: live, Gemini treats both identically.)
+    assert lookup.model_settings.tool_choice == "get_ruleset"
+    assert [t.name for t in lookup.tools] == ["get_ruleset"]  # its ONLY tool
+    assert lookup.output_type is None  # no JSON output -> the forced call is accepted
 
 
 def test_9a_forced_choice_reaches_the_wire_as_a_named_function() -> None:
     # What the SDK actually sends to a Chat Completions endpoint for this setting.
-    wire = Converter.convert_tool_choice(build_style_reviewer().model_settings.tool_choice)
+    wire = Converter.convert_tool_choice(build_style_ruleset_lookup().model_settings.tool_choice)
     assert wire == {"type": "function", "function": {"name": "get_ruleset"}}, wire
 
 
-def test_9a_forced_choice_resets_after_the_first_call() -> None:
-    # Without this, the model is forced to call get_ruleset every turn, never
-    # emits findings, and every Style run ends in MaxTurnsExceeded.
-    assert build_style_reviewer().reset_tool_choice is True
+def test_9a_lookup_stops_on_the_tool_so_its_output_is_the_tools_own() -> None:
+    # One model request; the run's output is get_ruleset's return value, never a
+    # model paraphrase of it.
+    assert build_style_ruleset_lookup().tool_use_behavior == "stop_on_first_tool"
 
 
-def test_9a_style_settings_otherwise_unchanged() -> None:
-    # Replacing ModelSettings wholesale must not drop the explicit settings
-    # Article I.4 / VI.1 require.
-    settings = build_style_reviewer().model_settings
-    assert settings.temperature == 0.1
-    assert settings.max_tokens == 4096
+def test_9a_style_reviewer_itself_has_no_tools_and_no_forced_choice() -> None:
+    style = build_style_reviewer()
+    assert style.tools == []
+    assert style.model_settings.tool_choice is None
+    assert style.output_type == list[Finding]
+    # Article I.4 / VI.1: explicit settings on both steps.
+    for agent in (style, build_style_ruleset_lookup()):
+        assert agent.model_settings.temperature == 0.1, agent.name
+        assert agent.model_settings.max_tokens == 4096, agent.name
+
+
+def test_9a_lookup_always_runs_first_and_its_ruleset_reaches_the_review() -> None:
+    install_stub({}, desk_output=None)
+    sent = []
+    original = review_runner.Runner.run
+
+    async def recording(agent=None, input=None, **kwargs):
+        sent.append((agent.name, input))
+        return await original(agent, input, **kwargs)
+
+    review_runner.Runner.run = recording
+    asyncio.run(review_runner.run_all_reviewers(DIFF, context()))
+
+    order = [name for name, _ in sent]
+    assert order.index(STYLE_RULESET_LOOKUP_NAME) < order.index(STYLE_REVIEWER_NAME)
+    style_input = next(i for name, i in sent if name == STYLE_REVIEWER_NAME)
+    ruleset = tools.load_ruleset_text("python-default")
+    # The exact text get_ruleset returned — not a summary, not the id.
+    assert style_input.startswith("RULESET\n" + ruleset)
+    assert DIFF in style_input
+    # Security and Tests still get the plain diff.
+    assert next(i for name, i in sent if name == SECURITY_REVIEWER_NAME) == DIFF
+
+
+def test_9a_no_tool_output_fails_style_alone_it_never_reviews_without_rules() -> None:
+    # If the lookup somehow produced no get_ruleset output, Style must fail
+    # plainly rather than review without the ruleset — and only Style.
+    async def lookup_without_tool_call(agent=None, input=None, **kwargs):
+        await asyncio.sleep(0.01)
+        if agent.name == STYLE_RULESET_LOOKUP_NAME:
+            return FakeResult("I decided not to call the tool.")  # no new_items
+        return FakeResult({SECURITY_REVIEWER_NAME: SECURITY_RAW,
+                           TESTS_REVIEWER_NAME: TESTS_RAW}[agent.name])
+
+    review_runner.Runner.run = lookup_without_tool_call
+    group = asyncio.run(review_runner.run_all_reviewers(DIFF, context()))
+    by_name = {o.reviewer: o for o in group.outcomes}
+    assert by_name[STYLE_REVIEWER_NAME].failed is True
+    assert "RulesetNotConsulted" in by_name[STYLE_REVIEWER_NAME].error
+    assert by_name[SECURITY_REVIEWER_NAME].failed is False
+    assert by_name[TESTS_REVIEWER_NAME].failed is False
 
 
 def test_9a_security_and_tests_keep_get_ruleset_optional() -> None:
@@ -185,8 +268,9 @@ def test_9b_deleted_ruleset_file_still_yields_a_usable_review_setup() -> None:
 calls: list[dict] = []
 
 
-def install_stub(failures: dict, desk_output) -> None:
-    """Stub the one model boundary. `failures` maps reviewer name -> exception."""
+def install_stub(failures: dict, desk_output, delay: float = 0.01) -> None:
+    """Stub the one model boundary. `failures` maps reviewer name -> exception;
+    `delay` is how long each stubbed run takes before returning or raising."""
     calls.clear()
     table = {
         SECURITY_REVIEWER_NAME: SECURITY_RAW,
@@ -197,7 +281,9 @@ def install_stub(failures: dict, desk_output) -> None:
     async def fake_run(agent=None, input=None, *, starting_agent=None, **kwargs):
         resolved = starting_agent if agent is None else agent
         calls.append({"agent": resolved.name, "max_turns": kwargs.get("max_turns")})
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(delay)
+        if resolved.name == STYLE_RULESET_LOOKUP_NAME:
+            return lookup_result(resolved)  # Style's forced get_ruleset step (FR-9a)
         if resolved.name == desk.DESK_NAME:
             return desk_output
         if resolved.name in failures:
@@ -216,10 +302,13 @@ def test_9c_every_reviewer_run_carries_the_ceiling() -> None:
     install_stub({}, desk_output=None)
     asyncio.run(review_runner.run_all_reviewers(DIFF, context()))
     reviewer_calls = [c for c in calls if c["agent"] != desk.DESK_NAME]
-    assert len(reviewer_calls) == 3
+    # Four runs: Security, Tests, and Style's two (its forced lookup, then its
+    # findings — FR-9a). EVERY run gets the ceiling, both of Style's included.
+    assert len(reviewer_calls) == 4
     assert {c["agent"] for c in reviewer_calls} == {
         SECURITY_REVIEWER_NAME,
         TESTS_REVIEWER_NAME,
+        STYLE_RULESET_LOOKUP_NAME,
         STYLE_REVIEWER_NAME,
     }
     assert all(c["max_turns"] == REVIEWER_MAX_TURNS == 6 for c in reviewer_calls)

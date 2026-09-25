@@ -96,8 +96,10 @@ def read_lines(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def review(diff: str = THREE_FILE_DIFF, failures: dict | None = None) -> Report:
-    install_stub(failures or {}, desk_output=desk_report())
+def review(
+    diff: str = THREE_FILE_DIFF, failures: dict | None = None, delay: float = 0.01
+) -> Report:
+    install_stub(failures or {}, desk_output=desk_report(), delay=delay)
     report, error = asyncio.run(desk.run_review(diff, context()))
     assert error is None, error
     assert isinstance(report, Report)
@@ -230,7 +232,8 @@ def test_failed_and_ceiling_runs_still_write_their_own_line() -> None:
             failures={
                 SECURITY_REVIEWER_NAME: ceiling(),
                 TESTS_REVIEWER_NAME: RuntimeError("connection reset"),
-            }
+            },
+            delay=0.05,
         )
         lines = read_lines(path)
 
@@ -240,9 +243,12 @@ def test_failed_and_ceiling_runs_still_write_their_own_line() -> None:
     by_agent = {line["agent"]: line for line in lines}
     for failed in (SECURITY_REVIEWER_NAME, TESTS_REVIEWER_NAME):
         assert by_agent[failed]["findings"] == 0
-        # Real elapsed time for a run that failed — the stub sleeps 10ms before
-        # failing, so a placeholder 0 would not pass.
-        assert by_agent[failed]["ms"] >= 10, by_agent[failed]
+        # Real elapsed time for a run that failed — each stubbed run takes 50 ms
+        # before failing, so a placeholder 0 cannot pass. The threshold is 30,
+        # not 50: asyncio schedules sleeps on the loop's coarse clock (15.6 ms
+        # ticks on Windows), so a sleep can end up to one tick early. The old
+        # 10 ms sleep / >= 10 check sat inside that margin and was flaky.
+        assert by_agent[failed]["ms"] >= 30, by_agent[failed]
     assert by_agent[STYLE_REVIEWER_NAME]["findings"] == len(STYLE_RAW)
     assert len({line["request_id"] for line in lines}) == 1
 

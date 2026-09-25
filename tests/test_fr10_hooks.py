@@ -51,12 +51,15 @@ DIFF = """diff --git a/billing/refunds.py b/billing/refunds.py
 +    return None
 """
 
-# Per reviewer: one (input, output) token pair per model call, in order.
-# Security and Style call get_ruleset first, then answer; Tests answers directly.
+# Per agent: one (input, output) token pair per model call, in order.
+# Security calls get_ruleset (optional for it), then answers; Tests answers
+# directly. Style is TWO runs (FR-9a): its lookup step makes the forced
+# get_ruleset call, then the Style Reviewer answers from the ruleset it was given.
 SCRIPT_USAGE = {
     "security": [(100, 20), (150, 30)],  # 120 + 180 = 300
     "tests": [(80, 10)],  # 90
-    "style": [(90, 15), (200, 25)],  # 105 + 225 = 330
+    "style_lookup": [(90, 15)],  # 105  — run 1 of Style
+    "style": [(200, 25)],  # 225        — run 2 of Style; Style total 330
 }
 EXPECTED_TOKENS = {
     SECURITY_REVIEWER_NAME: 300,
@@ -95,6 +98,8 @@ def _which(system_instructions: str | None) -> str:
         return "tests"
     if text.startswith("You are a code style reviewer"):
         return "style"
+    if text.startswith("You are the ruleset lookup step"):
+        return "style_lookup"
     raise AssertionError(f"unexpected agent prompt: {text[:60]!r}")
 
 
@@ -126,7 +131,7 @@ class ScriptedModel(Model):
 
     def __init__(self, fail_after: dict[str, int] | None = None):
         self.fail_after = fail_after or {}
-        self.calls: dict[str, int] = {"security": 0, "tests": 0, "style": 0}
+        self.calls: dict[str, int] = {"security": 0, "tests": 0, "style": 0, "style_lookup": 0}
 
     async def get_response(
         self,
@@ -150,7 +155,7 @@ class ScriptedModel(Model):
         await asyncio.sleep(0.01)
 
         usage = _usage(*SCRIPT_USAGE[key][index])
-        wants_tool_first = key in ("security", "style")
+        wants_tool_first = key in ("security", "style_lookup")
         if wants_tool_first and not _has_tool_output(input):
             output = [
                 ResponseFunctionToolCall(
@@ -383,7 +388,7 @@ def test_what_agent_level_hooks_see_that_run_level_hooks_do_not() -> None:
         assert run_hooks.stats.llm_calls == 2
         assert run_hooks.stats.tool_calls == 1
         assert run_hooks.stats.tokens == 300
-    assert first_run_hooks.stats.usage is not second_run_hooks.stats.usage
+    assert first_run_hooks.stats.usages[0] is not second_run_hooks.stats.usages[0]
 
     # Agent-level: one log spanning both runs, step by step, in order.
     assert kinds(security.hooks.events).count("start") == 2

@@ -42,7 +42,9 @@ from test_desk_agent import (
     SECURITY_RAW,
     STYLE_RAW,
     TESTS_RAW,
+    lookup_result,
 )
+from reviewers import STYLE_RULESET_LOOKUP_NAME
 from test_fr9 import ceiling
 
 # This file lives in tests/; the product files it inspects live one level up.
@@ -72,6 +74,8 @@ def install_timed_stub(failures=None, desk_output=None) -> None:
         resolved = starting_agent if agent is None else agent
         if resolved.name == desk.DESK_NAME:
             return desk_output
+        if resolved.name == STYLE_RULESET_LOOKUP_NAME:
+            return lookup_result(resolved)  # Style's forced get_ruleset step (FR-9a)
         await asyncio.sleep(DELAYS[resolved.name])
         if resolved.name in failures:
             raise failures[resolved.name]

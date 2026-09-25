@@ -18,7 +18,7 @@ graph TD
     D -->|asyncio.gather, concurrent| STY[Style Reviewer]
     SEC -->|tool, optional| RULESET[get_ruleset]
     TST -->|tool, optional| RULESET
-    STY -->|tool, REQUIRED| RULESET
+    STY -->|step 1: lookup, tool FORCED| RULESET
     SEC --> FSEC[list-Finding-]
     TST --> FTST[list-Finding-]
     STY --> FSTY[list-Finding-]
@@ -49,7 +49,8 @@ graph TD
 | **Base Reviewer** | Not exposed; exists only to be cloned | `gemini-3.6-flash`, baseline settings | Generic placeholder, always overridden | `list[Finding]` | none |
 | **Security Reviewer** | Vulnerabilities, unsafe patterns, credential-shaped strings in the diff | Cloned from Base; low temperature (e.g. 0.1) for precision | Built per-run from `ReviewContext` (FR-4); focuses on security-relevant patterns | `list[Finding]` | none (leaf) |
 | **Tests Reviewer** | Missing/weakened test coverage implied by the diff | Cloned from Base; moderate temperature (e.g. 0.2) | Built per-run from `ReviewContext` | `list[Finding]` | none (leaf) |
-| **Style Reviewer** | Ruleset violations — naming, formatting, structure | Cloned from Base; low temperature (e.g. 0.1) for consistency | Built per-run from `ReviewContext`; terser when `strictness == "strict"` | `list[Finding]` | none (leaf) |
+| **Style Ruleset Lookup** | Style's step 1: the forced `get_ruleset` call (FR-9a, §9) | Cloned from Base; low temperature (0.1); `tool_choice="get_ruleset"`; `stop_on_first_tool` | Static: "call get_ruleset, do nothing else" | none (plain) — its output is the tool's return value | none (leaf) |
+| **Style Reviewer** | Style's step 2: ruleset violations — naming, formatting, structure | Cloned from Base; low temperature (e.g. 0.1) for consistency; **no tools, no forced choice** | Built per-run from `ReviewContext`; terser when `strictness == "strict"`; reads the ruleset from its input | `list[Finding]` | none (leaf) |
 | **Merge Specialist** | Deduplicates and orders findings by severity | `gemini-3.6-flash`, low temperature | Single-purpose: merge, dedupe, order — never adds new findings | plain structured data (not a handoff target — a tool) | — |
 | **Remediation Specialist** | Proposes a fix for a critical security finding | `gemini-3.6-flash`, moderate temperature | Receives the critical finding(s); proposes a patch, never applies it (NG-2) | text/patch proposal | none (leaf) |
 
@@ -65,7 +66,7 @@ the reply transfers, so it is a handoff.
 | Name | Owner agent(s) | Parameters (model-supplied) | Context read internally | Returns | Failure behavior |
 |---|---|---|---|---|---|
 | `split_diff_by_file` | Desk (preprocessing, not exposed to any agent as a callable tool) | — | — | list of per-file diff chunks | Empty/malformed diff → returns an empty list with a reported reason; never raises |
-| `get_ruleset` | Style (**required** — see §9 below), Security, Tests (optional for these two) | none | **yes** — reads `context.ruleset_id` | ruleset text | Returns "ruleset unavailable" string if the file is missing/unreadable — never raises |
+| `get_ruleset` | Style Ruleset Lookup (**forced** — Style's step 1, see §9), Security, Tests (optional for these two) | none | **yes** — reads `context.ruleset_id` | ruleset text | Returns "ruleset unavailable" string if the file is missing/unreadable — never raises |
 | `merge_findings` (via Merge-as-tool) | Desk | the three reviewers' `list[Finding]` results | no | one deduplicated, severity-ordered `list[Finding]` | Returns the union unmodified (no dedup applied) with a note if the merge logic itself errors, rather than raising |
 
 `get_ruleset` satisfies FR-2's acceptance criterion: its generated schema has **zero parameters**,
@@ -206,20 +207,44 @@ entirely (FR-11's acceptance criterion).
 ## 9. Required Tool Call (FR-9a)
 
 **Design decision — which tool, which reviewer:** the Style Reviewer's `get_ruleset` call is
-configured as **required**, using this SDK's forced-tool-choice mechanism (e.g.
-`ModelSettings(tool_choice="get_ruleset")` or the equivalent for pinning a specific tool), so the
-Style Reviewer cannot produce findings without first consulting the ruleset. This is the concrete,
-demonstrable example of "the model has no choice but to call it."
+**forced** — the model has no choice but to make it, and Style cannot produce findings without the
+ruleset it returns. This is the concrete, demonstrable example of "the model has no choice but to
+call it."
+
+**Mechanism — two steps, not one agent (revised 2026-09-25).** The original plan was a single Style
+agent with `ModelSettings(tool_choice="get_ruleset")` and `output_type=list[Finding]`. A live run
+showed Gemini's OpenAI-compatible endpoint rejects that combination: HTTP 400, *"Forced function
+calling (ANY mode) with a response mime type: 'application/json' is unsupported."* Probed live, the
+same 400 comes back for `tool_choice="required"`, so there is no single-agent workaround; a forced
+call with **no** JSON output is accepted. Because the SDK attaches an agent's JSON output format to
+every request that agent makes, the force and the structured output must live on different agents:
+
+1. **Style Ruleset Lookup** — `tool_choice="get_ruleset"`, no `output_type`, `get_ruleset` as its only
+   tool, `tool_use_behavior="stop_on_first_tool"`. Exactly one model request, which must call the
+   tool; the run ends when the tool has executed, so its result is `get_ruleset`'s own return value.
+2. **Style Reviewer** — no tools, no forced choice, `output_type=list[Finding]`. Its input is that
+   exact ruleset text (under a `RULESET` heading) followed by the diff.
+
+`review_runner.run_reviewer` always runs step 1 before step 2, deterministically — the "no choice" is
+guaranteed by sequencing in code plus the forced call in step 1, not by the model's discretion. If step
+1 yields no tool output, Style fails plainly (`RulesetNotConsulted`) instead of reviewing without
+rules; only Style is affected. Both steps share Style's RunConfig (one trace group) and run-level
+hooks (footer tokens are their sum), and each gets the full turn ceiling. A missing ruleset is still a
+*consulted* one: the tool returns its "ruleset unavailable" sentence, and step 2's prompt falls back.
+
+No agent in the system may combine a forced `tool_choice` with a structured `output_type`; a
+structural test (`tests/test_fr9.py`) checks every agent definition for exactly that.
 
 ## 10. Turn Ceiling (FR-9c)
 
 **Design decision — ceiling value: 6 turns per reviewer.**
 
 Rationale: a single reviewer's job is narrower than a full conversation — read the diff it was
-given as input, call `get_ruleset` (forced for Style, optional for Security and Tests), and emit a
-`list[Finding]`. That is 1 turn for a reviewer that skips the tool and 2 for one that calls it, so 2
-is the realistic case; 6 leaves headroom for a model that calls `get_ruleset` again after its forced
-first call, while still bounding worst-case cost per reviewer. This is independent per reviewer —
+given as input, optionally call `get_ruleset` (Security and Tests), and emit a `list[Finding]`. That is
+1 turn for a reviewer that skips the tool and 2 for one that calls it. Style runs as two steps (§9),
+each 1 turn: the forced lookup ends on its tool call, and the review step has no tools. So 2 is the
+realistic maximum per run; 6 leaves headroom while still bounding worst-case cost. The ceiling applies
+to every run, both of Style's included. This is independent per reviewer —
 three reviewers running concurrently each get their own 6-turn budget, not a shared one.
 
 ## 11. Persistence for the Ledger (NFR-3)

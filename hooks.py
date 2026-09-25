@@ -22,7 +22,7 @@ case spec.md §4.10 says must still produce a footer row.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from agents import AgentHooks, RunContextWrapper, RunHooks, Usage
@@ -30,27 +30,34 @@ from agents import AgentHooks, RunContextWrapper, RunHooks, Usage
 
 @dataclass
 class ReviewerRunStats:
-    """What the run-level hooks saw for one reviewer run."""
+    """What the run-level hooks saw for one reviewer — across every run that
+    reviewer made (the Style Reviewer makes two: its forced ruleset lookup, then
+    its findings; FR-9a)."""
 
     agent_name: str | None = None
     llm_calls: int = 0
     tool_calls: int = 0
-    completed: bool = False  # on_agent_end fired — the run produced its output
+    completed: bool = False  # on_agent_end fired — a run produced its output
     started_at: float | None = None
     last_event_at: float | None = None
-    # A live reference to the run's Usage object, not a copy: it keeps
-    # accumulating as the run proceeds and survives an exception mid-run.
-    usage: Usage | None = None
+    # Live references to each run's own Usage object, not copies: each keeps
+    # accumulating as its run proceeds and survives an exception mid-run. One per
+    # run, because every Runner.run has its own context and its own Usage.
+    usages: list[Usage] = field(default_factory=list)
 
     @property
     def tokens(self) -> int | None:
-        """Real total tokens from the run context, or None if the run never got
-        far enough for the hooks to see its context (never guessed as 0)."""
-        return None if self.usage is None else self.usage.total_tokens
+        """Real total tokens summed over this reviewer's runs, or None if no run
+        got far enough for the hooks to see its context (never guessed as 0)."""
+        if not self.usages:
+            return None
+        return sum(usage.total_tokens for usage in self.usages)
 
     @property
     def requests(self) -> int | None:
-        return None if self.usage is None else self.usage.requests
+        if not self.usages:
+            return None
+        return sum(usage.requests for usage in self.usages)
 
 
 class ReviewerRunHooks(RunHooks[Any]):
@@ -61,12 +68,13 @@ class ReviewerRunHooks(RunHooks[Any]):
         self.stats = ReviewerRunStats()
 
     def _touch(self, context: RunContextWrapper[Any]) -> None:
-        now = time.monotonic()
+        now = time.perf_counter()
         if self.stats.started_at is None:
             self.stats.started_at = now
         self.stats.last_event_at = now
-        if self.stats.usage is None:
-            self.stats.usage = context.usage
+        # By identity: one entry per run context, however many events it fires.
+        if not any(usage is context.usage for usage in self.stats.usages):
+            self.stats.usages.append(context.usage)
 
     async def on_agent_start(self, context, agent) -> None:
         self._touch(context)

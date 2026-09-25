@@ -48,7 +48,8 @@ from reviewers import (
     STYLE_REVIEWER_NAME,
     TESTS_REVIEWER_NAME,
 )
-from test_desk_agent import DIFF, FakeResult, MERGED, SECURITY_RAW, STYLE_RAW, TESTS_RAW
+from reviewers import STYLE_RULESET_LOOKUP_NAME
+from test_desk_agent import DIFF, FakeResult, MERGED, SECURITY_RAW, STYLE_RAW, TESTS_RAW, lookup_result
 
 # This file lives in tests/; the product files it inspects live one level up.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -134,6 +135,8 @@ def install_stub(delays=None) -> None:
             }
         )
         await asyncio.sleep(delays.get(resolved.name, 0.01))
+        if resolved.name == STYLE_RULESET_LOOKUP_NAME:
+            return lookup_result(resolved)  # Style's forced get_ruleset step (FR-9a)
 
         if resolved.name == MERGE_SPECIALIST_NAME:
             return FakeResult(MERGED)
@@ -200,9 +203,10 @@ def test_every_run_of_a_review_carries_one_id_and_runs_in_one_trace() -> None:
     review()
 
     names = [r["agent"] for r in runs]
-    # 3 reviewers + the Desk + the Merge tool's nested run. Remediation is a
+    # 3 reviewers + Style's forced ruleset lookup (FR-9a) + the Desk + the Merge
+    # tool's nested run. Remediation is a
     # handoff inside the Desk's run, so it never appears as a run of its own.
-    assert sorted(names) == sorted(REVIEWERS + [desk.DESK_NAME, MERGE_SPECIALIST_NAME]), names
+    assert sorted(names) == sorted(REVIEWERS + [STYLE_RULESET_LOOKUP_NAME, desk.DESK_NAME, MERGE_SPECIALIST_NAME]), names
     assert REMEDIATION_SPECIALIST_NAME not in names
 
     request_id = assert_one_review_one_trace(runs)
@@ -273,7 +277,7 @@ def test_two_reviews_get_two_traces_even_when_concurrent() -> None:
     for trace_id in trace_ids:
         mine = [r for r in runs if r["trace_id"] == trace_id]
         assert sorted(r["agent"] for r in mine) == sorted(
-            REVIEWERS + [desk.DESK_NAME, MERGE_SPECIALIST_NAME]
+            REVIEWERS + [STYLE_RULESET_LOOKUP_NAME, desk.DESK_NAME, MERGE_SPECIALIST_NAME]
         )
         request_id = assert_one_review_one_trace(mine)
         assert trace_id == trace_id_for(request_id)

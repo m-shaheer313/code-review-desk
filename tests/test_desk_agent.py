@@ -16,14 +16,17 @@ import desk
 import main as entry
 import review_runner
 from agents.exceptions import OutputGuardrailTripwireTriggered
+from agents.items import ToolCallOutputItem
 from finding import Finding
 from guardrail import REFUSAL_MESSAGE, ReportRefused
 from merge import MERGE_INPUT_KEY, MERGE_TOOL_NAME
 from remediation import REMEDIATION_SPECIALIST_NAME
 from report import Report
 from review_context import ReviewContext
+from tools import load_ruleset_text
 from reviewers import (
     SECURITY_REVIEWER_NAME,
+    STYLE_RULESET_LOOKUP_NAME,
     STYLE_REVIEWER_NAME,
     TESTS_REVIEWER_NAME,
 )
@@ -86,6 +89,21 @@ DIRTY_PROPOSAL = 'PROPOSAL ONLY. Replace API_KEY = "sk_live_12345EXAMPLESECRETKE
 calls: list[tuple[str, object]] = []
 
 
+def lookup_result(agent):
+    """What the Style Reviewer's forced ruleset lookup (FR-9a) returns: the real
+    get_ruleset text, as a genuine tool-output item — the evidence production
+    code checks for (`review_runner._ruleset_from_lookup`)."""
+    text = load_ruleset_text("python-default")
+    item = ToolCallOutputItem(
+        agent=agent,
+        raw_item={"type": "function_call_output", "call_id": "call_lookup", "output": text},
+        output=text,
+    )
+    result = FakeResult(text, last_agent_name=agent.name)
+    result.new_items = [item]
+    return result
+
+
 class FakeResult:
     def __init__(self, final_output, last_agent_name=None):
         self.final_output = final_output
@@ -106,6 +124,8 @@ def install_stub(desk_output, reviewer_table=None):
         sent = kwargs.get("input", input)
         calls.append((resolved.name, sent))
         await asyncio.sleep(0.01)
+        if resolved.name == STYLE_RULESET_LOOKUP_NAME:
+            return lookup_result(resolved)  # Style's forced get_ruleset step (FR-9a)
         if resolved.name == desk.DESK_NAME:
             if isinstance(desk_output, BaseException):
                 raise desk_output
